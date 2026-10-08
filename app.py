@@ -29,7 +29,7 @@ except Exception:
     search_dates = None
 
 APP_NAME = "GameCodeSentinel"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (+local Windows code tracker; contact: local-user)"
 REQUEST_TIMEOUT = 18
 MAX_CRAWL_LINKS = 14
@@ -233,6 +233,31 @@ def connect_db() -> sqlite3.Connection:
                 "WHERE game=? AND status='active' AND used=0", (GAME_AION2,)
             )
         con.execute("INSERT INTO meta(key, value) VALUES('aion_strict_parser_v12','1')")
+    # v1.3.0 could misread reward nouns as coupon codes in Reddit posts.
+    # Recheck previously stored suspicious unredeemed entries conservatively,
+    # preserving official-source evidence and all user/notified history.
+    needs_shape_review = con.execute(
+        "SELECT value FROM meta WHERE key='aion_code_shape_review_v131'"
+    ).fetchone()
+    if needs_shape_review is None and {"game", "code", "status", "used", "sources_json"} <= existing_cols:
+        for row in con.execute(
+            "SELECT id, code, sources_json FROM codes "
+            "WHERE game=? AND status='active' AND used=0", (GAME_AION2,)
+        ).fetchall():
+            if looks_like_code(GAME_AION2, row["code"]):
+                continue
+            try:
+                sources = json.loads(row["sources_json"] or "[]")
+            except (TypeError, ValueError):
+                sources = []
+            if any(isinstance(src, dict) and src.get("kind") == "official" for src in sources):
+                continue
+            con.execute(
+                "UPDATE codes SET status='review', score=0, "
+                "confidence='RIVERIFICA NECESSARIA (FORMA CODICE SOSPETTA)' "
+                "WHERE id=?", (row["id"],)
+            )
+        con.execute("INSERT INTO meta(key, value) VALUES('aion_code_shape_review_v131','1')")
     con.commit()
     return con
 
@@ -257,7 +282,11 @@ def looks_like_code(game: str, token: str, context: str = "") -> bool:
         return False
     # Game name and alphanumeric strings are not sufficient evidence for an AION coupon.
     if game == GAME_AION2:
-        return len(token) >= 8 and bool(re.search(r"[A-Za-z]", token))
+        # Reward names (e.g. "Resurrection Spiritstone") can appear after
+        # "code:" in user-submitted posts. TitleCase words are not coupons.
+        # Support uppercase codes and codes containing digits without a whitelist.
+        return (len(token) >= 8 and bool(re.search(r"[A-Za-z]", token))
+                and (token.isupper() or any(ch.isdigit() for ch in token)))
     if game == GAME_ANIIMO and (
         token.lower().startswith("aniimo") or token.lower().startswith("any") or token.lower().startswith("twine")
     ):

@@ -299,3 +299,43 @@ def test_www_redirect_stays_allowed():
     sess = Mock()
     sess.get.return_value = resp
     assert app.http_get(sess, 'https://destructoid.com/aion-2-codes/') is resp
+
+
+def test_aion_reddit_reward_name_not_a_coupon_even_after_explicit_code_label():
+    src = app.Source(app.GAME_AION2, "Reddit r/Aion2", "https://reddit.com/r/Aion2", "community")
+    html = ("<h1>New coupon code TAKEFLIGHTAION2</h1>"
+            "<p>New coupon code: TAKEFLIGHTAION2\\nCode: Resurrection Spiritstone (Bound) x5</p>")
+    codes = [item.code for item in app.extract_candidates_html(app.GAME_AION2, html, src, src.url)]
+    assert codes == ["TAKEFLIGHTAION2"]
+
+
+@pytest.mark.parametrize("value", ["Resurrection", "Spiritstone", "Battle", "Enhancement"])
+def test_aion_title_case_reward_terms_never_accepted_as_codes(value):
+    assert not app.looks_like_code(app.GAME_AION2, value, "Coupon code: " + value)
+
+
+@pytest.mark.parametrize("value", ["TAKEFLIGHTAION2", "FREEDAEVAGIFT", "AionGift2026"])
+def test_aion_coupon_shapes_supported_without_hardcoded_allowlist(value):
+    assert app.looks_like_code(app.GAME_AION2, value, "Redeem code " + value)
+
+
+def test_aion_legacy_false_reddit_code_is_quarantined_on_upgrade(isolated_db):
+    con = app.connect_db()
+    suspicious = app.merge_candidates([app.Candidate(
+        app.GAME_AION2, "Resurrection", "Spiritstone x5", "Reddit r/Aion2",
+        "https://reddit.com/r/Aion2/", "community")])
+    legitimate = app.merge_candidates([app.Candidate(
+        app.GAME_AION2, "TAKEFLIGHTAION2", "Spiritstone x5", "Reddit r/Aion2",
+        "https://reddit.com/r/Aion2/", "community")])
+    app.upsert_candidates(con, suspicious)
+    app.upsert_candidates(con, legitimate)
+    con.execute("DELETE FROM meta WHERE key='aion_code_shape_review_v131'")
+    con.commit()
+    con.close()
+    con = app.connect_db()
+    records = {r["code"]: r for r in con.execute("SELECT * FROM codes")}
+    assert records["Resurrection"]["status"] == "review"
+    assert records["Resurrection"]["score"] == 0
+    assert records["TAKEFLIGHTAION2"]["status"] == "active"
+    assert con.execute("SELECT COUNT(*) FROM codes").fetchone()[0] == 2
+    con.close()

@@ -1,10 +1,10 @@
-# GameCode Sentinel 1.3
+# GameCode Sentinel 1.3.1
 
-Windows tracker for **AION 2**, **Genshin Impact** and **Aniimo** redemption codes. Local SQLite database; notifications are optional. Code detection is probabilistic: a published string is not proof it can be redeemed.
+Windows tracker for **AION 2**, **Genshin Impact** and **Aniimo** redemption codes. Local SQLite database; notifications are optional. Code detection is probabilistic: a published string is not proof it can be redeemed. Version 1.3.1 rejects common AION 2 reward names accidentally tagged as codes and quarantines previously stored suspicious Reddit entries.
 
 ## Windows (without Python)
 
-After a successful GitHub Actions run, download the `GameCodeSentinel-Windows-v1.3` artifact from the **Build Windows EXE** workflow, unzip, and run `GameCodeSentinel.exe`. Windows SmartScreen may warn for an unsigned executable. Only install software you trust.
+After a successful GitHub Actions run, download the `GameCodeSentinel-Windows-v1.3.1` artifact from the **Build Windows EXE** workflow, unzip, and run `GameCodeSentinel.exe`. Windows SmartScreen may warn for an unsigned executable. Only install software you trust.
 
 ## From source
 
@@ -20,7 +20,7 @@ Exit status 2 means zero sources were reachable. `python app.py --version` only 
 ## CI
 
 - **Cross-platform Tests**: 54 regression tests on Windows and Ubuntu with Python 3.11 and 3.13. This workflow also performs a live AION 2 HTTP scan on main-branch changes, manual invocation, and daily at 06:37 UTC. Scan reports are public; web sources may rate-limit requests.
-- **Build Windows EXE**: native Windows compilation with PyInstaller, executable exit-code smoke test, and SHA-256 checksum. Download the `GameCodeSentinel-Windows-v1.3` artifact from a green run; the EXE is not signed.
+- **Build Windows EXE**: native Windows compilation with PyInstaller, executable exit-code smoke test, and SHA-256 checksum. Download the `GameCodeSentinel-Windows-v1.3.1` artifact from a green run; the EXE is not signed.
 - **Dependabot**: weekly update proposals for Python dependencies and GitHub Actions; review any proposed changes before merging.
 - The GitHub live scan is **stateless**. Your personal code history remains local on your Windows PC. A code mentioned online is not necessarily a redeemable coupon.
 

@@ -1,0 +1,43 @@
+name: AION 2 Live HTTP Scan
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/live-scan.yml'
+  workflow_dispatch:
+  schedule:
+    - cron: '37 6 * * *'
+permissions:
+  contents: read
+concurrency:
+  group: aion2-diagnostic-scan
+  cancel-in-progress: true
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      LOCALAPPDATA: ${{ runner.temp }}/GameCodeSentinelCI
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install HTTP scanner dependencies
+        run: python -m pip install 'requests>=2.32,<3' 'beautifulsoup4>=4.12,<5' 'dateparser>=1.2,<2'
+      - name: Scan live AION 2 sources
+        run: python app.py --check --headless --game "AION 2" --report-json scan-report.json
+      - name: Display diagnostic report
+        if: always()
+        shell: bash
+        run: |
+          if [ -f scan-report.json ]; then cat scan-report.json; else echo 'No report generated'; fi
+      - name: Upload non-sensitive diagnostic
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: AION2-Live-Scan-Diagnostic
+          path: scan-report.json
+          if-no-files-found: warn
+          retention-days: 3

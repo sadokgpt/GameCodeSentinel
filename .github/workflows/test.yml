@@ -62,11 +62,16 @@ jobs:
           else
             echo "No scan report available"
           fi
+      - name: Show detected AION 2 candidates and source evidence
+        if: always()
+        run: python scripts/scan_diagnostic.py
       - name: Upload scan report
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: AION2-Live-Scan-Report
-          path: scan-report.json
+          path: |
+            scan-report.json
+            scan-candidates.json
           if-no-files-found: warn
           retention-days: 3

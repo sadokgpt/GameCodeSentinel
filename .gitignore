@@ -1,0 +1,26 @@
+# Python / packaging
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+*.spec
+
+# Local data (never publish)
+config.json
+codes.db
+codes.db-*
+*.sqlite3
+*.sqlite3-*
+*.log
+.env
+.env.*
+!.env.example
+
+# IDE/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

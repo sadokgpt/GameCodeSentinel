@@ -42,8 +42,6 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      LOCALAPPDATA: ${{ runner.temp }}/GameCodeSentinelCI
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -52,6 +50,8 @@ jobs:
       - name: Install HTTP scanner
         run: python -m pip install requests beautifulsoup4 dateparser
       - name: Scan AION 2 without notifications
+        env:
+          LOCALAPPDATA: ${{ runner.temp }}/GameCodeSentinelCI
         run: python app.py --check --headless --game "AION 2" --report-json scan-report.json
       - name: Print diagnostic summary
         if: always()

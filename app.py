@@ -29,7 +29,7 @@ except Exception:
     search_dates = None
 
 APP_NAME = "GameCodeSentinel"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (+local Windows code tracker; contact: local-user)"
 REQUEST_TIMEOUT = 18
 MAX_CRAWL_LINKS = 14
@@ -258,6 +258,23 @@ def connect_db() -> sqlite3.Connection:
                 "WHERE id=?", (row["id"],)
             )
         con.execute("INSERT INTO meta(key, value) VALUES('aion_code_shape_review_v131','1')")
+    # Existing Genshin classifications predate section-aware parsing.
+    # Back up once and quarantine unredeemed records until a new reliable scan.
+    if con.execute("SELECT 1 FROM meta WHERE key='genshin_section_review_v132'").fetchone() is None:
+        con.commit()
+        if con.execute("SELECT COUNT(*) FROM codes WHERE game=? AND status='active' AND used=0",
+                       (GAME_GENSHIN,)).fetchone()[0]:
+            backup_path = DB_PATH.with_name("codes.before_v1.3.2.sqlite3")
+            if not backup_path.exists():
+                backup_con = sqlite3.connect(backup_path)
+                try:
+                    con.backup(backup_con)
+                finally:
+                    backup_con.close()
+            con.execute("UPDATE codes SET status='review', score=0, "
+                        "confidence='RIVERIFICA GENSHIN 1.3.2' "
+                        "WHERE game=? AND status='active' AND used=0", (GAME_GENSHIN,))
+        con.execute("INSERT INTO meta(key,value) VALUES('genshin_section_review_v132','1')")
     con.commit()
     return con
 
@@ -545,12 +562,22 @@ def extract_candidates_html(game: str, html: str, source: Source, page_url: str)
         ):
             out[norm] = cand
 
+    def section_state(node) -> str:
+        """Read the closest preceding heading, not an unrelated page-wide heading."""
+        heading = node.find_previous(["h1", "h2", "h3", "h4", "h5", "h6"])
+        heading_text = heading.get_text(" ", strip=True) if heading else ""
+        if re.search(r"(?i)expired|scadut|inactive|old\\s+codes|no\\s+longer\\s+valid", heading_text):
+            return "expired"
+        if re.search(r"(?i)active|working|valid|current", heading_text):
+            return "active"
+        return ""
+
     # <code> tags and URLs with ?code=...
     for tag in soup.find_all("code"):
         token = tag.get_text(" ", strip=True)
         heading = tag.find_previous(["h1", "h2", "h3", "h4"])
         heading_text = heading.get_text(" ", strip=True) if heading else ""
-        status_override = "expired" if re.search(r"expired|scadut", heading_text, re.I) else ""
+        status_override = section_state(tag)
         ctx = (heading_text + " | " + (tag.parent.get_text(" ", strip=True) if tag.parent else token)).strip(" |")
         add(token, ctx, status_override=status_override)
     for a in soup.find_all("a", href=True):
@@ -559,7 +586,7 @@ def extract_candidates_html(game: str, html: str, source: Source, page_url: str)
             qs = parse_qs(urlparse(href).query)
             for key in ("code", "redeemCode", "coupon"):
                 for token in qs.get(key, []):
-                    add(token, a.parent.get_text(" ", strip=True) if a.parent else href)
+                    add(token, a.parent.get_text(" ", strip=True) if a.parent else href, status_override=section_state(a))
         except Exception:
             pass
 
@@ -576,9 +603,9 @@ def extract_candidates_html(game: str, html: str, source: Source, page_url: str)
         heading = block.find_previous(["h1", "h2", "h3", "h4"])
         heading_text = heading.get_text(" ", strip=True) if heading else ""
         status_override = ""
-        if re.search(r"expired|scadut|old codes", heading_text + " | " + block_text, re.I):
+        if re.search(r"expired|scadut|old codes|no longer valid", block_text, re.I) or section_state(block) == "expired":
             status_override = "expired"
-        elif re.search(r"active|working|current|valid|available", heading_text, re.I):
+        elif section_state(block) == "active":
             status_override = "active"
         for m in explicit.finditer(block_text):
             add(m.group(1), f"{status_override} {heading_text} | {block_text}", status_override=status_override)
@@ -595,9 +622,9 @@ def extract_candidates_html(game: str, html: str, source: Source, page_url: str)
         heading_text = heading.get_text(" ", strip=True) if heading else ""
         status_override = ""
         row_text = " | ".join(cells)
-        if re.search(r"expired|scadut|old codes", heading_text + " | " + row_text, re.I):
+        if re.search(r"expired|scadut|old codes|no longer valid", row_text, re.I) or section_state(tr) == "expired":
             status_override = "expired"
-        elif re.search(r"active|working|current|valid|available", heading_text, re.I):
+        elif section_state(tr) == "active":
             status_override = "active"
         token = cells[0].strip().strip("`'\"“”")
         row_ctx = "code " + heading_text + " | " + row_text
@@ -618,16 +645,19 @@ def extract_candidates_html(game: str, html: str, source: Source, page_url: str)
         nearby = " | ".join(text_lines[idx:idx+10])
         reward_nearby = reward_window(text_lines, idx)
         for m in explicit.finditer(line):
-            add(m.group(1), f"{section_status} {nearby}", reward_hint=reward_nearby, status_override=section_status)
+            if normalize_code(m.group(1)) not in out:
+                add(m.group(1), f"{section_status} {nearby}", reward_hint=reward_nearby, status_override=section_status)
 
         m = line_pat.match(line)
-        if m:
+        if m and normalize_code(m.group(1)) not in out:
             add(m.group(1), f"{section_status} code {line}", m.group(2), section_status)
 
     # Fallback for strongly code-shaped tokens near code/reward wording.
     # Deliberately excludes ordinary TitleCase words to reduce false positives.
     for m in re.finditer(r"\b[A-Za-z0-9][A-Za-z0-9_-]{7,20}\b", text):
         token = m.group(0)
+        if normalize_code(token) in out:
+            continue  # A local structured classification outranks broad text fallback.
         token_shape = (
             (any(ch.isdigit() for ch in token) and any(ch.isalpha() for ch in token))
             or token.isupper()
@@ -974,6 +1004,14 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
                 active_weight += weight_map.get(kind, 0.5)
         item["status"] = "expired" if expired_weight >= active_weight and expired_weight > 0 else "active"
 
+        # An explicit expired entry on a maintained tracker must not be overridden
+        # by an old official news post or a broad-context active guess.
+        if item["game"] == GAME_GENSHIN and any(
+            kind == "secondary" and status == "expired"
+            for kind, status in item["source_states"].values()
+        ):
+            item["status"] = "expired"
+
         if item["expires_at"]:
             try:
                 exp = datetime.strptime(item["expires_at"], "%Y-%m-%d %H:%M")
@@ -1047,7 +1085,7 @@ def upsert_candidates(con: sqlite3.Connection, merged: dict[tuple[str, str], dic
                 code = row["code"]
 
         reward = item["rewards"] if len(item["rewards"] or "") >= len(row["rewards"] or "") else row["rewards"]
-        expires = row["expires_at"] or item["expires_at"]
+        expires = item["expires_at"] or row["expires_at"]
         status = item["status"]
         if row["used"] and row["status"] == "invalid":
             status = "invalid"

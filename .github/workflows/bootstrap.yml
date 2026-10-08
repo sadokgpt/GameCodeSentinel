@@ -1,70 +1,36 @@
-name: Import source, tests and Windows build
+name: GameCodeSentinel Bootstrap
 on:
   push:
     branches: [main]
     paths:
       - '.github/workflows/bootstrap.yml'
-      - 'GameCodeSentinel_v1.3_GitHub_ready.zip'
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   import-source:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: true
-      - name: Safely extract reviewed v1.3 sources
-        shell: bash
-        run: |
-          python - <<'PY'
-          import pathlib
-          import stat
-          import zipfile
-
-          package = pathlib.Path("GameCodeSentinel_v1.3_GitHub_ready.zip")
-          if not package.is_file():
-              raise SystemExit("Version 1.3 ZIP not present in repository")
-          with zipfile.ZipFile(package) as archive:
-              for item in archive.infolist():
-                  name = pathlib.PurePosixPath(item.filename)
-                  if name.is_absolute() or ".." in name.parts or not name.parts:
-                      raise SystemExit(f"Unsafe archive path: {item.filename}")
-                  if stat.S_IFMT(item.external_attr >> 16) == stat.S_IFLNK:
-                      raise SystemExit(f"Symlink refused: {item.filename}")
-                  if name.name in {"config.json", "codes.db", "app.log", ".env"}:
-                      raise SystemExit(f"Sensitive local file refused: {item.filename}")
-                  if item.is_dir() or item.filename == ".gitignore":
-                      continue
-                  target = pathlib.Path(*name.parts)
-                  target.parent.mkdir(parents=True, exist_ok=True)
-                  target.write_bytes(archive.read(item))
-          for required in ("app.py", "requirements.txt", "tests/test_core.py", ".github/workflows/build-windows.yml"):
-              if not pathlib.Path(required).is_file():
-                  raise SystemExit(f"Missing project file: {required}")
-          PY
-      - name: Publish extracted source files
+      - uses: actions/checkout@v4
+      - name: Extract source
+        run: python scripts/bootstrap.py
+      - name: Commit extracted files
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           if ! git diff --cached --quiet; then
-            git commit -m "chore: import reviewed 1.3 sources from ZIP"
+            git commit -m "chore: import 1.3 source from reviewed archive"
             git push origin HEAD:main
           fi
-
   build-windows:
     needs: import-source
     runs-on: windows-latest
     timeout-minutes: 30
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -73,54 +39,21 @@ jobs:
         with:
           python-version: '3.13'
           cache: pip
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: python -m pip install -r requirements.txt pytest
-      - name: Regression suite
+      - name: Run tests
         run: python -m pytest -q
-      - name: Build Windows executable
+      - name: Compile executable
         run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name GameCodeSentinel app.py
-      - name: Verify EXE starts and exits normally
+      - name: Verify EXE
         shell: pwsh
         run: |
           & .\dist\GameCodeSentinel.exe --version
-          if ($LASTEXITCODE -ne 0) { throw "EXE smoke test failed: $LASTEXITCODE" }
-      - name: Upload Windows EXE
+          if ($LASTEXITCODE -ne 0) { throw "Executable smoke test failed" }
+      - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
           name: GameCodeSentinel-Windows-v1.3
           path: dist/GameCodeSentinel.exe
           if-no-files-found: error
           retention-days: 7
-
-  live-aion2-scan:
-    needs: import-source
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: read
-    env:
-      LOCALAPPDATA: ${{ runner.temp }}/GCSData
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: main
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-          cache: pip
-      - name: Install scanning dependencies
-        run: python -m pip install requests beautifulsoup4 dateparser
-      - name: AION 2 HTTP scan (without notifications)
-        id: scan
-        continue-on-error: true
-        run: python app.py --check --headless --game "AION 2" --report-json scan-report.json
-      - name: Show scan status
-        run: echo "Scan step outcome was ${{ steps.scan.outcome }}; failure can indicate inaccessible sources."
-      - name: Upload public scan diagnostic
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: AION2-Live-Scan-Diagnostic
-          path: scan-report.json
-          if-no-files-found: warn
-          retention-days: 3

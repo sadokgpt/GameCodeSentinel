@@ -260,7 +260,8 @@ def connect_db() -> sqlite3.Connection:
         con.execute("INSERT INTO meta(key, value) VALUES('aion_code_shape_review_v131','1')")
     # Existing Genshin classifications predate section-aware parsing.
     # Back up once and quarantine unredeemed records until a new reliable scan.
-    if con.execute("SELECT 1 FROM meta WHERE key='genshin_section_review_v132'").fetchone() is None:
+    if ({"game", "status", "used", "score", "confidence"} <= existing_cols
+            and con.execute("SELECT 1 FROM meta WHERE key='genshin_section_review_v132'").fetchone() is None):
         con.commit()
         if con.execute("SELECT COUNT(*) FROM codes WHERE game=? AND status='active' AND used=0",
                        (GAME_GENSHIN,)).fetchone()[0]:

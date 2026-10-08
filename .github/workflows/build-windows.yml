@@ -44,7 +44,7 @@ jobs:
       - name: Upload tested EXE and checksum
         uses: actions/upload-artifact@v7
         with:
-          name: GameCodeSentinel-Windows-v1.3
+          name: GameCodeSentinel-Windows-v1.3.1
           path: |
             dist/GameCodeSentinel.exe
             dist/SHA256SUMS.txt

@@ -1,0 +1,43 @@
+GAMECODE SENTINEL 1.1 - REVISIONE TECNICA
+=========================================
+
+Correzioni principali rispetto alla v1:
+- notifiche Windows e telefono tracciate separatamente;
+- una notifica fallita non viene più marcata come consegnata;
+- nessuna rinotifica automatica dello stesso codice solo perché ricompare;
+- migrazione dalla v1 conserva il vecchio stato di notifica per evitare duplicati;
+- Aniimo conserva la capitalizzazione della fonte più autorevole;
+- fallback Reddit RSS non dipende più implicitamente da lxml;
+- scansione limitata anche dei commenti Reddit pertinenti, per intercettare codici presenti solo nei commenti;
+- retry HTTP limitati per errori temporanei e rate limiting;
+- parser migliorato per premi multilinea e tabelle;
+- correzione dei casi in cui una riga "expired" poteva essere forzata come attiva;
+- riconoscimento anche delle sezioni "Current codes";
+- più fonti indipendenti per Genshin, Aniimo e AION 2;
+- la pagina generica HoYoverse non viene usata come prova che un codice sia attivo;
+- soglia notifica più prudente: 85;
+- due sole fonti community non bastano per una notifica automatica;
+- gestione "stale": un codice sparito ripetutamente da un tracker viene nascosto;
+- salvataggio configurazione atomico;
+- installer Windows con controllo Python e gestione errori più chiara;
+- pulsante di test per la notifica ntfy;
+- task di recupero all'accesso a Windows, oltre al controllo giornaliero.
+
+Controlli automatici eseguiti sulla versione consegnata:
+- compilazione sintattica Python: OK
+- suite test: 23 test superati
+
+I test coprono, tra l'altro:
+- estrazione codice/ricompensa;
+- Aniimo e maiuscole/minuscole;
+- premi multilinea AION 2;
+- sezioni attive/scadute;
+- deduplicazione delle fonti Reddit;
+- scoring fonti;
+- discovery di link in pagine SPA;
+- database e migrazione notifiche;
+- separazione notifiche PC/telefono;
+- persistenza del punteggio verificato;
+- assenza di rinotifica dopo ricomparsa;
+- passaggio automatico a stale dopo assenze ripetute;
+- estrazione di codici presenti solo nei commenti Reddit senza falsi voti indipendenti.

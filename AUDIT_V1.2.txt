@@ -1,0 +1,50 @@
+GAMECODE SENTINEL 1.2 — AUDIT E HARDENING
+========================================
+Data revisione: 8 ottobre 2026.
+
+CAUSE RIPRODOTTE
+- Versione 1.1: in una pagina AION 2 senza coupon il parser segnalava
+  GLOBAL2026, AION2GLOBAL, EVENT2026 come codici attivi "ufficiali".
+- Mancava un controllo sull'indipendenza dei publisher: Pro Game Guides e
+  Destructoid appartengono entrambi a GAMURS Group.
+- La somma delle evidenze in DB conservava il massimo storico anche con prove
+  correnti deboli, inducendo notifiche errate/vecchie.
+- Se un codice ricompariva da Reddit, il vecchio tracker mancante non
+  contribuiva al conteggio di staleness.
+- Commenti "not working" potevano risultare sia positivi sia negativi.
+- CLI --check senza --headless serializzava oggetti SQLite Row nel JSON.
+
+FIX
+1. Nuovo estrattore AION 2 senza fallback lessicale indiscriminato.
+2. Istruzione di riscatto o elenco codici esplicito; esclusione esempi/dummy.
+3. Scadenza EU esplicita e stop all'uso di date di pubblicazione come scadenze.
+4. Editor indipendenti per il punteggio, con GAMURS raggruppato.
+5. Punteggio aggiornato in base alle prove attuali.
+6. Migrazione AION 2 già archiviato: stato 'review' e backup DB automatico.
+7. Un nuovo avviso viene inviato solo se il codice è trovato nella scansione corrente.
+8. Corretto conteggio miss dei tracker anche con repost sui social.
+9. Conteggio Reddit negativo/positivo mutuamente esclusivo e per codice.
+10. Scadenze applicate anche se il programma è stato offline.
+11. Filtro grafico per storico/scaduti/da rivedere.
+12. Redirect non attendibili e challenge anti-bot gestiti come errori.
+13. ntfy: il topic segreto è oscurato nei log di errore HTTP.
+14. Output CLI --check corretto.
+
+VALIDAZIONE
+- 50 test automatizzati superati in Python.
+- Sintassi app.py: OK.
+- Test integrato con fonte ufficiale simulata: un solo codice vero,
+  nessun identificativo spurio, notifica non duplicata.
+- Non verificati in questo ambiente: scansioni HTTP live complete,
+  notifiche reali su Windows/Android, creazione task Windows e build .exe.
+
+FONTE PRIMARIA AION2: https://lounge.plaync.com/feed/82955?country=US&locale=en-US
+Coupon confermato l'8 ottobre 2026: TAKEFLIGHTAION2,
+scadenza Europa 14/10/2026 ore 08:00 CEST.
+FONTE EDITORI: https://progameguides.com/about-us/
+
+LIMITI
+- Nessun servizio senza login conferma in modo universale il riscatto di un
+  codice sul proprio account. Possono esistere promozioni regionali.
+- I siti cambiano HTML e policy anti-bot: il programma conserva log e non
+  inventa conferme se le fonti non rispondono.

@@ -24,3 +24,4 @@ codes.db-*
 .idea/
 .DS_Store
 Thumbs.db
+scan-report.json

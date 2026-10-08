@@ -51,7 +51,7 @@ jobs:
           & .\dist\GameCodeSentinel.exe --version
           if ($LASTEXITCODE -ne 0) { throw "Executable smoke test failed" }
       - name: Upload EXE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: GameCodeSentinel-Windows-v1.3
           path: dist/GameCodeSentinel.exe

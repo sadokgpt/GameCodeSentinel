@@ -35,7 +35,7 @@ jobs:
           if [ -f scan-report.json ]; then cat scan-report.json; else echo 'No report generated'; fi
       - name: Upload non-sensitive diagnostic
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v6
         with:
           name: AION2-Live-Scan-Diagnostic
           path: scan-report.json

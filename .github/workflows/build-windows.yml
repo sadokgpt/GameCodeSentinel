@@ -32,8 +32,9 @@ jobs:
       - name: Smoke test EXE
         shell: pwsh
         run: |
-          & .\dist\GameCodeSentinel.exe --version
-          if ($LASTEXITCODE -ne 0) { throw "EXE smoke test failed with code $LASTEXITCODE" }
+          $exe = (Resolve-Path "dist/GameCodeSentinel.exe").Path
+          $process = Start-Process -FilePath $exe -ArgumentList "--version" -Wait -PassThru -ErrorAction Stop
+          if ($process.ExitCode -ne 0) { throw "EXE smoke test failed with code $($process.ExitCode)" }
       - name: Generate SHA256 checksum
         shell: pwsh
         run: |

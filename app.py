@@ -29,7 +29,7 @@ except Exception:
     search_dates = None
 
 APP_NAME = "GameCodeSentinel"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (+local Windows code tracker; contact: local-user)"
 REQUEST_TIMEOUT = 18
 MAX_CRAWL_LINKS = 14
@@ -343,9 +343,16 @@ def extract_expiry(context: str) -> str:
     ):
         return ""
     try:
+        # "future" would silently assign next year to an already expired
+        # yearless date (for example "Expires Oct 2" scanned on Oct 8).
+        # Anchor yearless dates to this calendar year, never to next year.
         found = search_dates(
             nearby,
-            settings={"PREFER_DATES_FROM": "future", "RETURN_AS_TIMEZONE_AWARE": False},
+            settings={
+                "PREFER_DATES_FROM": "current_period",
+                "RELATIVE_BASE": datetime(datetime.now().year, 1, 1),
+                "RETURN_AS_TIMEZONE_AWARE": False,
+            },
             languages=["en", "it"],
         )
         if not found:
@@ -892,6 +899,7 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
                 "rewards": "",
                 "status": "active",
                 "expires_at": "",
+                "expiry_source_kind": "",
                 "sources": [],
                 "confirmations": 0,
                 "negatives": 0,
@@ -922,8 +930,18 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
         if state is None or (state[1] != "active" and c.status == "active"):
             item["source_states"][c.source_name] = (c.source_kind, c.status)
 
-        if c.expires_at and (not item["expires_at"] or c.source_kind == "official"):
-            item["expires_at"] = c.expires_at
+        if c.expires_at:
+            # Prefer an official expiry over tracker/community dates. When
+            # equally authoritative sources disagree, use the earlier deadline
+            # instead of silently keeping a potentially expired code active.
+            prior_kind = item["expiry_source_kind"]
+            if (
+                not item["expires_at"]
+                or (c.source_kind == "official" and prior_kind != "official")
+                or (c.source_kind == prior_kind and c.expires_at < item["expires_at"])
+            ):
+                item["expires_at"] = c.expires_at
+                item["expiry_source_kind"] = c.source_kind
         item["confirmations"] = max(item["confirmations"], c.reddit_confirmations)
         item["negatives"] = max(item["negatives"], c.reddit_negatives)
 
@@ -1047,10 +1065,36 @@ def upsert_candidates(con: sqlite3.Connection, merged: dict[tuple[str, str], dic
                 code = row["code"]
 
         reward = item["rewards"] if len(item["rewards"] or "") >= len(row["rewards"] or "") else row["rewards"]
-        expires = row["expires_at"] or item["expires_at"]
+        old_expiry = row["expires_at"] or ""
+        new_expiry = item["expires_at"] or ""
+        official_new_expiry = item.get("expiry_source_kind") == "official"
+        # A stored deadline must not disappear on a weak repost. Only an
+        # explicitly dated *official* extension can supersede an old deadline.
+        expires = old_expiry or new_expiry
+        extended = bool(
+            old_expiry and new_expiry and official_new_expiry
+            and new_expiry > old_expiry
+        )
+        if extended:
+            expires = new_expiry
         status = item["status"]
         if row["used"] and row["status"] == "invalid":
             status = "invalid"
+        elif row["status"] == "expired" and status == "active":
+            if old_expiry:
+                # Expired coupons do not become active just because an old
+                # news article or a Reddit post still mentions them.
+                # A new *official* deadline beyond the old one is required.
+                if not extended:
+                    status = "expired"
+            else:
+                # Without a known end date, demand stronger fresh corroboration
+                # before undoing the explicit expired classification.
+                kinds_now = {s.get("kind") for s in item["sources"]}
+                if not ("official" in kinds_now or (
+                    "secondary" in kinds_now and score >= 85
+                )):
+                    status = "expired"
         elif row["status"] in {"stale", "review"} and status == "active":
             kinds_now = {s.get("kind") for s in item["sources"]}
             reliable = "official" in kinds_now or (
@@ -1478,7 +1522,7 @@ def gui_main() -> None:
             except Exception:
                 src_count = r["source_count"]
             seen = (r["first_seen"] or "").replace("T", " ")[:16]
-            display_status = {"active": "Segnalato attivo", "expired": "Scaduto", "stale": "Non più rilevato",
+            display_status = {"active": "Segnalato (non garantito)", "expired": "Scaduto", "stale": "Non più rilevato",
                               "review": "Da riverificare", "invalid": "Non valido"}.get(r["status"], r["status"])
             tree.insert("", "end", iid=str(r["id"]), values=(
                 r["game"], r["code"], display_status, r["rewards"] or "—", r["confidence"], r["expires_at"] or "—", seen, r["source_count"],

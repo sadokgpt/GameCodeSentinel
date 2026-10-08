@@ -1,0 +1,51 @@
+name: Build Windows EXE
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app.py'
+      - 'requirements.txt'
+      - 'tests/**'
+      - '.github/workflows/build-windows.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pytest
+      - name: Run all regression tests
+        run: python -m pytest -q
+      - name: Build native Windows EXE
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name GameCodeSentinel app.py
+      - name: Smoke test EXE
+        shell: pwsh
+        run: |
+          & .\dist\GameCodeSentinel.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "EXE smoke test failed with code $LASTEXITCODE" }
+      - name: Generate SHA256 checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash "dist/GameCodeSentinel.exe" -Algorithm SHA256).Hash.ToLower()
+          "$hash  GameCodeSentinel.exe" | Set-Content -Path "dist/SHA256SUMS.txt" -Encoding utf8
+          Write-Host "SHA256: $hash"
+      - name: Upload tested EXE and checksum
+        uses: actions/upload-artifact@v7
+        with:
+          name: GameCodeSentinel-Windows-v1.3
+          path: |
+            dist/GameCodeSentinel.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7

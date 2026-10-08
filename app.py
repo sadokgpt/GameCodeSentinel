@@ -221,8 +221,11 @@ def connect_db() -> sqlite3.Connection:
         # Consistent snapshot (including WAL) before first v1.2 migration.
         backup_path = DB_PATH.with_name("codes.before_v1.2.sqlite3")
         if not backup_path.exists() and con.execute("SELECT COUNT(*) FROM codes").fetchone()[0] > 0:
-            with sqlite3.connect(backup_path) as backup_con:
+            backup_con = sqlite3.connect(backup_path)
+            try:
                 con.backup(backup_con)
+            finally:
+                backup_con.close()
         if {"game", "status", "used", "score", "confidence", "expires_at"} <= existing_cols:
             con.execute(
                 "UPDATE codes SET status='review', score=0, expires_at='', "

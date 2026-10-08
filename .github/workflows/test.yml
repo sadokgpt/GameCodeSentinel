@@ -9,6 +9,8 @@ on:
       - '.github/workflows/test.yml'
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: '37 6 * * *'
 permissions:
   contents: read
 jobs:
@@ -36,3 +38,35 @@ jobs:
         run: python -m pytest -q
       - name: Check CLI startup
         run: python app.py --version
+  scan-aion2:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      LOCALAPPDATA: ${{ runner.temp }}/GameCodeSentinelCI
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Install HTTP scanner
+        run: python -m pip install requests beautifulsoup4 dateparser
+      - name: Scan AION 2 without notifications
+        run: python app.py --check --headless --game "AION 2" --report-json scan-report.json
+      - name: Print diagnostic summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f scan-report.json ]; then
+            cat scan-report.json
+          else
+            echo "No scan report available"
+          fi
+      - name: Upload scan report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: AION2-Live-Scan-Report
+          path: scan-report.json
+          if-no-files-found: warn
+          retention-days: 3

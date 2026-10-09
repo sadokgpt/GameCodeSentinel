@@ -1542,7 +1542,7 @@ def remove_daily_task() -> tuple[bool, str]:
 
 def gui_main() -> None:
     import tkinter as tk
-    from tkinter import ttk, messagebox
+    from tkinter import ttk, messagebox, filedialog
     import secrets
 
     cfg = load_config()
@@ -1579,6 +1579,7 @@ def gui_main() -> None:
     ttk.Button(controls, text="Fonti", command=lambda: show_sources_selected()).pack(side="left", padx=3)
     ttk.Button(controls, text="Impostazioni", command=lambda: open_settings()).pack(side="right")
     ttk.Button(controls, text="Stato fonti", command=lambda: show_source_health()).pack(side="right", padx=5)
+    ttk.Button(controls, text="Backup", command=lambda: show_backups()).pack(side="right", padx=5)
 
     filters = ttk.Frame(root, padding=(10, 0, 10, 8))
     filters.pack(fill="x")
@@ -1659,6 +1660,29 @@ def gui_main() -> None:
         row = con.execute("SELECT * FROM codes WHERE id=?", (row_id,)).fetchone()
         con.close()
         return row
+
+    def show_backups():
+        window = tk.Toplevel(root)
+        window.title("Backup e ripristino")
+        window.geometry("540x180")
+        frame = ttk.Frame(window, padding=16)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Copie locali dello storico codici; le ultime sette sono conservate.").pack(pady=10)
+
+        def create():
+            with operation_lock(DATA_DIR, "scan") as allowed:
+                if not allowed:
+                    messagebox.showwarning(APP_NAME, "Scansione in corso.", parent=window)
+                    return
+                try:
+                    path = backup_sqlite(DB_PATH, force=True)
+                    messagebox.showinfo(APP_NAME, f"Backup salvato: {path}", parent=window)
+                except Exception as exc:
+                    messagebox.showerror(APP_NAME, str(exc), parent=window)
+
+        ttk.Button(frame, text="Crea backup", command=create).pack(side="left", padx=8)
+        ttk.Button(frame, text="Ripristina", command=lambda: restore_from_dialog(window)).pack(side="left", padx=8)
+        ttk.Button(frame, text="Chiudi", command=window.destroy).pack(side="right")
 
     def show_source_health():
         con = connect_db()

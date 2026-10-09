@@ -1578,6 +1578,7 @@ def gui_main() -> None:
     ttk.Button(controls, text="Segna non valido", command=lambda: mark_selected("invalid")).pack(side="left", padx=3)
     ttk.Button(controls, text="Fonti", command=lambda: show_sources_selected()).pack(side="left", padx=3)
     ttk.Button(controls, text="Impostazioni", command=lambda: open_settings()).pack(side="right")
+    ttk.Button(controls, text="Stato fonti", command=lambda: show_source_health()).pack(side="right", padx=5)
 
     filters = ttk.Frame(root, padding=(10, 0, 10, 8))
     filters.pack(fill="x")
@@ -1658,6 +1659,32 @@ def gui_main() -> None:
         row = con.execute("SELECT * FROM codes WHERE id=?", (row_id,)).fetchone()
         con.close()
         return row
+
+    def show_source_health():
+        con = connect_db()
+        try:
+            data = con.execute(
+                "SELECT a.* FROM source_checks a WHERE id=("
+                "SELECT MAX(id) FROM source_checks WHERE source_name=a.source_name)"
+                " ORDER BY game, source_name"
+            ).fetchall()
+        finally:
+            con.close()
+        window = tk.Toplevel(root)
+        window.title("Diagnostica fonti")
+        window.geometry("1010x440")
+        columns = ("gioco", "fonte", "stato", "codici", "durata", "data", "errore")
+        table = ttk.Treeview(window, columns=columns, show="headings")
+        for col, width in zip(columns, (120, 240, 75, 70, 65, 175, 240)):
+            table.heading(col, text=col.capitalize())
+            table.column(col, width=width)
+        table.pack(fill="both", expand=True, padx=10, pady=10)
+        for row in data:
+            table.insert("", "end", values=(
+                row["game"], row["source_name"], row["status"],
+                row["candidates"], row["elapsed_ms"], row["checked_at"][:19], row["error"]
+            ))
+        ttk.Button(window, text="Chiudi", command=window.destroy).pack(pady=5)
 
     def sort_by(col):
         if order["column"] == col:

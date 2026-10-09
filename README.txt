@@ -1,4 +1,4 @@
-GAMECODE SENTINEL 1.2
+GAMECODE SENTINEL 1.3.3
 =====================
 
 OBIETTIVO
@@ -207,3 +207,11 @@ LIMITI IMPORTANTI
 - I test automatici sono stati eseguiti in ambiente Python; la GUI e il Task Scheduler
   Windows richiedono una prova sulla macchina finale.
 - Per eseguire i test: python -m pip install pytest ; python -m pytest -q tests
+
+GESTIONE MULTIPLA DEI CODICI (1.3.3)
+-----------------------------------
+Ctrl+clic seleziona singole righe; Maiusc+clic seleziona intervalli.
+Ctrl+A o Seleziona tutti visibili seleziona tutte le righe attualmente mostrate.
+Segna usati nasconde i codici senza cancellarli.
+Mostra usati + Ripristina usati permette di annullare la marcatura.
+I codici Non valido non vengono ripristinati automaticamente.

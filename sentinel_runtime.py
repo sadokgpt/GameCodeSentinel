@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, closing
 from datetime import datetime
 from pathlib import Path
 
@@ -45,8 +45,8 @@ def backup_sqlite(db_path: Path, keep: int = 7, min_interval_hours: int = 24,
     destination = target_dir / f"codes-{stamp}.sqlite3"
     staging = target_dir / f".codes-{stamp}.tmp"
     try:
-        with sqlite3.connect(str(db_path), timeout=30) as source:
-            with sqlite3.connect(str(staging), timeout=30) as dest:
+        with closing(sqlite3.connect(str(db_path), timeout=30)) as source:
+            with closing(sqlite3.connect(str(staging), timeout=30)) as dest:
                 source.backup(dest)
                 result = dest.execute("PRAGMA integrity_check").fetchone()[0]
                 if result != "ok":
@@ -71,12 +71,12 @@ def restore_sqlite(db_path: Path, backup_path: Path) -> Path:
         raise ValueError("È possibile ripristinare solo un backup creato da GameCodeSentinel")
     if not backup_path.is_file():
         raise FileNotFoundError(backup_path)
-    with sqlite3.connect(str(backup_path)) as source:
+    with closing(sqlite3.connect(str(backup_path))) as source:
         if source.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise sqlite3.DatabaseError("Backup danneggiato")
         # Force a separate snapshot so undo is possible even after restoration.
         backup_sqlite(db_path, force=True)
-        with sqlite3.connect(str(db_path), timeout=30) as target:
+        with closing(sqlite3.connect(str(db_path), timeout=30)) as target:
             source.backup(target)
     return backup_path
 

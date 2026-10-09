@@ -1,5 +1,5 @@
 requests>=2.32,<3
-beautifulsoup4>=4.12,<5
+beautifulsoup4>=4.15.0,<5
 dateparser>=1.4.3,<2
 winotify>=1.1,<2
 pyinstaller>=6.10,<7

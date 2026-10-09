@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import html as html_lib
 import json
 import os
@@ -14,6 +15,7 @@ import webbrowser
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Iterable, Optional
 from urllib.parse import quote_plus, urljoin, urlparse, parse_qs
@@ -22,6 +24,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
+from sentinel_runtime import operation_lock, backup_sqlite, restore_sqlite, plausible_tracker_page
 
 try:
     from dateparser.search import search_dates
@@ -29,10 +32,11 @@ except Exception:
     search_dates = None
 
 APP_NAME = "GameCodeSentinel"
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.4.0"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (+local Windows code tracker; contact: local-user)"
 REQUEST_TIMEOUT = 18
 MAX_CRAWL_LINKS = 14
+MAX_SCAN_WORKERS = 3
 
 GAME_GENSHIN = "Genshin Impact"
 GAME_ANIIMO = "Aniimo"
@@ -157,6 +161,11 @@ def connect_db() -> sqlite3.Connection:
     ensure_dirs()
     con = sqlite3.connect(DB_PATH, timeout=20)
     con.row_factory = sqlite3.Row
+    # Preserve an online WAL-safe backup before touching schema or records.
+    try:
+        backup_sqlite(DB_PATH)
+    except Exception as exc:
+        log(f"Backup periodico non riuscito: {exc}")
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA busy_timeout=20000")
     con.execute(
@@ -211,6 +220,19 @@ def connect_db() -> sqlite3.Connection:
         )
         """
     )
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS source_checks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            checked_at TEXT NOT NULL,
+            source_name TEXT NOT NULL,
+            game TEXT NOT NULL,
+            status TEXT NOT NULL,
+            candidates INTEGER NOT NULL DEFAULT 0,
+            elapsed_ms INTEGER NOT NULL DEFAULT 0,
+            error TEXT DEFAULT ''
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_source_checks_name_id ON source_checks(source_name,id)")
     con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     # AION 2 in v1.1 was parsed by a very permissive word scanner. Previously saved
     # "official" results must not stay visible without being checked by the new parser.
@@ -737,7 +759,12 @@ def discover_crawl_links(base_url: str, raw_html: str, link_hint: str = "") -> l
 
 def fetch_page_source(session: requests.Session, source: Source) -> tuple[list[Candidate], int]:
     resp = http_get(session, source.url)
-    return extract_candidates_html(source.game, resp.text, source, resp.url), 1
+    found = extract_candidates_html(source.game, resp.text, source, resp.url)
+    # A soft-404 / cookie wall returning HTTP 200 is NOT reliable evidence
+    # that codes previously listed by a tracker have gone away.
+    if source.kind == "secondary" and not found and not plausible_tracker_page(resp.text, source.game):
+        raise ValueError("Pagina tracker non riconoscibile: assenza codici non verificabile")
+    return found, 1
 
 
 def fetch_crawl_source(session: requests.Session, source: Source) -> tuple[list[Candidate], int]:
@@ -1200,74 +1227,145 @@ def expire_stored_codes(con: sqlite3.Connection) -> int:
 
 
 def run_check(cfg: Optional[dict] = None) -> dict:
-    cfg = cfg or load_config()
-    session = build_http_session()
+    """Skip overlapping manual/scheduled scans, preserving notifications and DB state."""
+    with operation_lock(DATA_DIR, "scan") as acquired:
+        if not acquired:
+            return {
+                "ok_sources": 0, "failed_sources": 0, "failures": [],
+                "candidates": 0, "inserted": 0, "stale_marked": 0,
+                "expired_marked": 0, "new_rows": [], "notify_rows": [],
+                "notify_rows_pc": [], "notify_rows_phone": [],
+                "skipped": True, "reason": "Controllo gia' in corso su un'altra istanza",
+            }
+        return _run_check_unlocked(cfg)
 
+
+def _run_check_unlocked(cfg: Optional[dict] = None) -> dict:
+    cfg = cfg or load_config()
     all_candidates: list[Candidate] = []
-    ok = 0
-    failed = []
+    failures: list[str] = []
     successful_source_names: set[str] = set()
+    details: list[tuple[str, str, str, int, int, str]] = []
+
+    # At most one concurrent request group per host, and only three workers.
+    # A separate Session per source avoids thread-shared requests.Session state.
+    host_locks: dict[str, threading.Lock] = {}
     for source in SOURCES:
-        try:
-            if source.mode == "page":
-                found, _ = fetch_page_source(session, source)
-            elif source.mode == "crawl":
-                found, _ = fetch_crawl_source(session, source)
-            elif source.mode == "reddit":
-                found, _ = fetch_reddit_source(session, source, cfg)
-            else:
-                continue
-            all_candidates.extend(found)
-            ok += 1
-            successful_source_names.add(source.name)
-            log(f"OK {source.name}: {len(found)} candidati")
-        except Exception as exc:
-            failed.append(f"{source.name}: {exc}")
-            log(f"ERRORE {source.name}: {exc}")
+        host = urlparse(source.url).hostname or ("reddit.com" if source.mode == "reddit" else source.name)
+        host_locks.setdefault(host.lower(), threading.Lock())
+
+    def scan_one(source: Source) -> tuple[list[Candidate], int]:
+        host = (urlparse(source.url).hostname or
+                ("reddit.com" if source.mode == "reddit" else source.name)).lower()
+        with host_locks[host]:
+            with build_http_session() as session:
+                if source.mode == "page":
+                    return fetch_page_source(session, source)
+                if source.mode == "crawl":
+                    return fetch_crawl_source(session, source)
+                if source.mode == "reddit":
+                    return fetch_reddit_source(session, source, cfg)
+                raise ValueError(f"Modalita' fonte non supportata: {source.mode}")
+
+    started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    with ThreadPoolExecutor(max_workers=MAX_SCAN_WORKERS) as executor:
+        pending = {executor.submit(scan_one, source): (source, time.monotonic())
+                   for source in SOURCES}
+        for future in as_completed(pending):
+            source, start_clock = pending[future]
+            elapsed = int((time.monotonic() - start_clock) * 1000)
+            try:
+                found, _ = future.result()
+                all_candidates.extend(found)
+                successful_source_names.add(source.name)
+                details.append((started_at, source.name, source.game, len(found), elapsed, ""))
+                log(f"OK {source.name}: {len(found)} candidati")
+            except Exception as exc:
+                message = f"{source.name}: {exc}"
+                failures.append(message)
+                details.append((started_at, source.name, source.game, 0, elapsed, str(exc)[:500]))
+                log(f"ERRORE {message}")
 
     merged = merge_candidates(all_candidates)
     con = connect_db()
-    inserted, new_rows = upsert_candidates(con, merged)
-    stale_marked = update_missing_codes(con, merged, successful_source_names)
-    expired_marked = expire_stored_codes(con)
-    con.execute(
-        "INSERT INTO checks (checked_at, ok_sources, failed_sources, candidates, error_summary) VALUES (?, ?, ?, ?, ?)",
-        (
-            datetime.now().astimezone().isoformat(timespec="seconds"), ok, len(failed), len(merged),
-            " | ".join(failed)[:4000],
-        ),
-    )
-    con.commit()
+    try:
+        inserted, new_rows = upsert_candidates(con, merged)
+        stale_marked = update_missing_codes(con, merged, successful_source_names)
+        expired_marked = expire_stored_codes(con)
+        for checked_at, name, game, count, elapsed, error in details:
+            con.execute(
+                "INSERT INTO source_checks(checked_at, source_name, game, status, candidates, elapsed_ms, error)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (checked_at, name, game, "error" if error else "ok", count, elapsed, error),
+            )
+        # Keep diagnostics bounded on long-lived installations.
+        con.execute("DELETE FROM source_checks WHERE id NOT IN "
+                    "(SELECT id FROM source_checks ORDER BY id DESC LIMIT 3000)")
+        con.execute(
+            "INSERT INTO checks (checked_at, ok_sources, failed_sources, candidates, error_summary) VALUES (?, ?, ?, ?, ?)",
+            (started_at, len(successful_source_names), len(failures), len(merged),
+             " | ".join(failures)[:4000]),
+        )
+        con.commit()
 
-    threshold = int(cfg.get("notify_min_score", 85))
-    base_sql = "SELECT * FROM codes WHERE used=0 AND status='active' AND score>=?"
-    pc_rows: list[sqlite3.Row] = []
-    phone_rows: list[sqlite3.Row] = []
-    # Never alert from a historical DB row which was not seen in THIS scan.
-    # This also avoids old bogus AION 2 records triggering on an upgrade.
-    if cfg.get("notify_pc"):
-        pc_rows = [r for r in con.execute(base_sql + " AND notified_pc=0 ORDER BY score DESC, first_seen DESC", (threshold,))
-                   if (r["game"], r["normalized"]) in merged]
-    if cfg.get("notify_phone") and cfg.get("ntfy_topic"):
-        phone_rows = [r for r in con.execute(base_sql + " AND notified_phone=0 ORDER BY score DESC, first_seen DESC", (threshold,))
-                      if (r["game"], r["normalized"]) in merged]
+        threshold = int(cfg.get("notify_min_score", 85))
+        base_sql = "SELECT * FROM codes WHERE used=0 AND status='active' AND score>=?"
+        pc_rows: list[sqlite3.Row] = []
+        phone_rows: list[sqlite3.Row] = []
+        if cfg.get("notify_pc"):
+            pc_rows = [r for r in con.execute(base_sql + " AND notified_pc=0 ORDER BY score DESC, first_seen DESC", (threshold,))
+                       if (r["game"], r["normalized"]) in merged]
+        if cfg.get("notify_phone") and cfg.get("ntfy_topic"):
+            phone_rows = [r for r in con.execute(base_sql + " AND notified_phone=0 ORDER BY score DESC, first_seen DESC", (threshold,))
+                          if (r["game"], r["normalized"]) in merged]
+    finally:
+        con.close()
 
     union = {r["id"]: r for r in pc_rows}
     union.update({r["id"]: r for r in phone_rows})
-    con.close()
     return {
-        "ok_sources": ok,
-        "failed_sources": len(failed),
-        "failures": failed,
-        "candidates": len(merged),
-        "inserted": inserted,
-        "stale_marked": stale_marked,
-        "expired_marked": expired_marked,
-        "new_rows": new_rows,
-        "notify_rows": list(union.values()),
-        "notify_rows_pc": pc_rows,
-        "notify_rows_phone": phone_rows,
+        "ok_sources": len(successful_source_names),
+        "failed_sources": len(failures), "failures": failures,
+        "candidates": len(merged), "inserted": inserted,
+        "stale_marked": stale_marked, "expired_marked": expired_marked,
+        "new_rows": new_rows, "notify_rows": list(union.values()),
+        "notify_rows_pc": pc_rows, "notify_rows_phone": phone_rows,
+        "skipped": False,
     }
+
+def deliver_notifications(result: dict, cfg: dict) -> dict:
+    """Serialize delivery and re-check flags under a cross-process lock.
+
+    Failures leave flags unset for a later eligible scan. A crash after a provider
+    accepts a notification but before commit can still cause one retry.
+    """
+    delivered = {"pc": 0, "phone": 0}
+    with operation_lock(DATA_DIR, "notifications", timeout=5) as acquired:
+        if not acquired:
+            log("Notifiche rimandate: un'altra istanza le sta inviando")
+            return delivered
+        for channel in ("pc", "phone"):
+            incoming = result.get("notify_rows_" + channel, [])
+            if not incoming:
+                continue
+            con = connect_db()
+            try:
+                column = "notified_pc" if channel == "pc" else "notified_phone"
+                eligible = []
+                for row in incoming:
+                    fresh = con.execute("SELECT * FROM codes WHERE id=?", (row["id"],)).fetchone()
+                    if fresh is not None and not fresh[column] and not fresh["used"] and fresh["status"] == "active":
+                        eligible.append(fresh)
+                ok = (notify_pc(eligible) if channel == "pc"
+                      else notify_phone(eligible, cfg)) if eligible else False
+                if ok:
+                    con.executemany(f"UPDATE codes SET {column}=1 WHERE id=?",
+                                    [(r["id"],) for r in eligible])
+                    con.commit()
+                    delivered[channel] = len(eligible)
+            finally:
+                con.close()
+    return delivered
 
 
 def notify_pc(rows: list[sqlite3.Row]) -> bool:

@@ -1822,11 +1822,10 @@ def gui_main() -> None:
                 cfg2 = load_config()
                 pc_rows = result["notify_rows_pc"]
                 phone_rows = result["notify_rows_phone"]
-                if pc_rows and notify_pc(pc_rows):
-                    mark_channel_notified(pc_rows, "pc")
-                if phone_rows and notify_phone(phone_rows, cfg2):
-                    mark_channel_notified(phone_rows, "phone")
-                msg = f"Controllo completato: {result['ok_sources']} fonti OK, {result['inserted']} nuovi codici"
+                if not result.get("skipped"):
+                    deliver_notifications(result, cfg2)
+                msg = ("Controllo gia' in corso" if result.get("skipped") else
+                       f"Controllo completato: {result['ok_sources']} fonti OK, {result['inserted']} nuovi codici")
                 if result.get("stale_marked"):
                     msg += f", {result['stale_marked']} non più rilevati nascosti"
                 if result["failed_sources"]:
@@ -1932,6 +1931,7 @@ def gui_main() -> None:
 def cli_main() -> int:
     parser = argparse.ArgumentParser(description=APP_NAME)
     parser.add_argument("--version", action="store_true", help="Mostra la versione senza aprire GUI/database")
+    parser.add_argument("--backup", action="store_true", help="Backup immediato")
     parser.add_argument("--game", choices=GAMES, help="Controlla solo un gioco")
     parser.add_argument("--report-json", type=Path, help="Salva rapporto della scansione in JSON")
     parser.add_argument("--check", action="store_true", help="Controlla le fonti e aggiorna il database")
@@ -1947,6 +1947,14 @@ def cli_main() -> int:
 
     cfg = load_config()
     connect_db().close()
+
+    if args.backup:
+        with operation_lock(DATA_DIR, "scan", timeout=5) as acquired:
+            if not acquired:
+                print("Backup non disponibile: scansione in corso")
+                return 3
+            print("Backup:", backup_sqlite(DB_PATH, force=True))
+        return 0
 
     if args.install_task:
         ok, msg = install_daily_task(cfg.get("schedule_time", "08:00"))
@@ -1966,18 +1974,13 @@ def cli_main() -> int:
             summary["game_filter"] = args.game or "all"
             args.report_json.parent.mkdir(parents=True, exist_ok=True)
             args.report_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-        if args.notify:
-            pc_rows = result["notify_rows_pc"]
-            phone_rows = result["notify_rows_phone"]
-            if pc_rows and notify_pc(pc_rows):
-                mark_channel_notified(pc_rows, "pc")
-            if phone_rows and notify_phone(phone_rows, cfg):
-                mark_channel_notified(phone_rows, "phone")
+        if args.notify and not result.get("skipped"):
+            deliver_notifications(result, cfg)
         if not args.headless:
             print(json.dumps({k: v for k, v in result.items() if not k.startswith("notify_rows") and k != "new_rows"}, ensure_ascii=False, indent=2))
         # If all sources failed, exit nonzero: otherwise a CI scan looks green
         # while having inspected nothing. Partial failure remains reportable.
-        return 2 if result["ok_sources"] == 0 else 0
+        return 3 if result.get("skipped") else (2 if result["ok_sources"] == 0 else 0)
 
     if not args.headless:
         gui_main()

@@ -1,10 +1,10 @@
-# GameCode Sentinel 1.3.3
+# GameCode Sentinel 1.4.0
 
 Windows tracker for **AION 2**, **Genshin Impact** and **Aniimo** redemption codes. Local SQLite database; notifications are optional. Code detection is probabilistic: a published string is not proof it can be redeemed. Version 1.3.2 rejects common AION 2 reward names accidentally tagged as codes and quarantines previously stored suspicious Reddit entries.
 
 ## Windows (without Python)
 
-After a successful GitHub Actions run, download the `GameCodeSentinel-Windows-v1.3.3` artifact from the **Build Windows EXE** workflow, unzip, and run `GameCodeSentinel.exe`. Windows SmartScreen may warn for an unsigned executable. Only install software you trust.
+After a successful GitHub Actions run, download the `GameCodeSentinel-Windows-v1.4.0` artifact from the **Build Windows EXE** workflow, unzip, and run `GameCodeSentinel.exe`. Windows SmartScreen may warn for an unsigned executable. Only install software you trust.
 
 ## From source
 
@@ -19,8 +19,8 @@ Exit status 2 means zero sources were reachable. `python app.py --version` only 
 
 ## CI
 
-- **Cross-platform Tests**: 54 regression tests on Windows and Ubuntu with Python 3.11 and 3.13. This workflow also performs a live AION 2 HTTP scan on main-branch changes, manual invocation, and daily at 06:37 UTC. Scan reports are public; web sources may rate-limit requests.
-- **Build Windows EXE**: native Windows compilation with PyInstaller, executable exit-code smoke test, and SHA-256 checksum. Download the `GameCodeSentinel-Windows-v1.3.3` artifact from a green run; the EXE is not signed.
+- **Cross-platform Tests**: automated regression tests on Windows and Ubuntu with Python 3.11 and 3.13. This workflow also performs a live AION 2 HTTP scan on main-branch changes, manual invocation, and daily at 06:37 UTC. Scan reports are public; web sources may rate-limit requests.
+- **Build Windows EXE**: native Windows compilation with PyInstaller, executable exit-code smoke test, and SHA-256 checksum. Download the `GameCodeSentinel-Windows-v1.4.0` artifact from a green run; the EXE is not signed.
 - **Dependabot**: weekly update proposals for Python dependencies and GitHub Actions; review any proposed changes before merging.
 - The GitHub live scan is **stateless**. Your personal code history remains local on your Windows PC. A code mentioned online is not necessarily a redeemable coupon.
 
@@ -29,6 +29,21 @@ Do not commit `config.json`, `codes.db`, `.env`, notification topics, logs or cr
 ## Notes
 
 The license has not been selected. Public visibility is not a license granting reuse. Credits and previous technical audit are in `AUDIT_V1.1.txt` and `AUDIT_V1.2.txt`.
+
+## Novita' 1.4.0 - affidabilita' e diagnostica
+
+- **Stato fonti**: elenco degli ultimi esiti (OK/errore), codici individuati, latenza e dettagli del fallimento.
+- **Controlli concorrenti**: al massimo tre fonti alla volta, senza condividere sessioni HTTP, e un solo scan locale alla volta. L'invocazione CLI occupata esce con stato 3.
+- **Tracker soft-404**: una pagina non riconoscibile che riporta zero codici non fa avanzare automaticamente l'assenza di codici precedentemente rilevati.
+- **Backup**: snapshot SQLite consistente, incluso WAL, automatico ogni 24 ore e rotazione ultime 7 copie. GUI: pulsante Backup; CLI: `python app.py --backup`. Le copie restano solo nel profilo Windows locale, in `%LOCALAPPDATA%\\GameCodeSentinel\\backups`.
+- **Notifiche**: elaborazione protetta da lock, nuova verifica dello stato del codice prima dell'invio e flag separati per PC/telefono.
+- **Scadenze**: le date senza orario vengono considerate fino alle 23:59; le scadenze EU esplicite AION 2 sono confrontate usando Europe/Rome.
+- **Tabella**: ricerca per codice/ricompensa, clic sull'intestazione per ordinare, colonna Ultima vista.
+- **Distribuzione**: EXE Windows collaudato in CI disponibile per 30 giorni fra gli artifact. Il workflow `release-windows.yml` pubblica un rilascio duraturo quando viene creato un tag Git `v1.4.0` corrispondente a `APP_VERSION`.
+
+### Aggiornamento e limiti
+
+Prima di sostituire un EXE precedente esegui un backup del database. Le installazioni mantengono lo stesso file `codes.db` e gli stati già usati. Un backup può essere verificato/ripristinato con gli strumenti SQLite: il pulsante di ripristino guidato non è ancora presente nell'interfaccia. Una fonte che risponde HTTP 200 può comunque aver cambiato semantica pur mantenendo testi simili: la verifica delle pagine non è una garanzia assoluta. La notifica è ritentabile quando fallisce, ma un arresto tra il recapito effettivo e il salvataggio del flag può causare un duplicato.
 
 ## Gestione multipla dei codici (1.3.3)
 

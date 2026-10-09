@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import html as html_lib
 import json
 import os
@@ -14,6 +15,7 @@ import webbrowser
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Iterable, Optional
 from urllib.parse import quote_plus, urljoin, urlparse, parse_qs
@@ -22,6 +24,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
+from sentinel_runtime import operation_lock, backup_sqlite, restore_sqlite, plausible_tracker_page
 
 try:
     from dateparser.search import search_dates
@@ -29,10 +32,11 @@ except Exception:
     search_dates = None
 
 APP_NAME = "GameCodeSentinel"
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.4.0"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (+local Windows code tracker; contact: local-user)"
 REQUEST_TIMEOUT = 18
 MAX_CRAWL_LINKS = 14
+MAX_SCAN_WORKERS = 3
 
 GAME_GENSHIN = "Genshin Impact"
 GAME_ANIIMO = "Aniimo"
@@ -93,6 +97,7 @@ SOURCES = [
     Source(GAME_ANIIMO, "Reddit r/AniimoGuide", "", "community", "reddit", subreddit="AniimoGuide"),
 
     Source(GAME_AION2, "AION 2 - PURPLE Lounge ufficiale", "https://lounge.plaync.com/tag/13519", "official", "crawl", "/feed/"),
+    Source(GAME_AION2, "AION 2 - Official coupon news", "https://lounge.plaync.com/feed/82955", "official", "page"),
     Source(GAME_AION2, "Steam - Annunci ufficiali AION 2", "https://steamcommunity.com/app/3393110/announcements/", "official", "page"),
     Source(GAME_AION2, "AION 2 - Notice ufficiali", "https://aion2.plaync.com/en-us/board/notice/list", "official", "crawl", "/board/notice/view"),
     Source(GAME_AION2, "NCSOFT - News", "https://about.ncsoft.com/en/news", "official", "crawl", "/en/news/article/aion2"),
@@ -128,6 +133,7 @@ def ensure_dirs() -> None:
 def log(msg: str) -> None:
     ensure_dirs()
     stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with LOG_PATH.open("a", encoding="utf-8") as f:
         f.write(f"[{stamp}] {msg}\n")
 
@@ -157,6 +163,13 @@ def connect_db() -> sqlite3.Connection:
     ensure_dirs()
     con = sqlite3.connect(DB_PATH, timeout=20)
     con.row_factory = sqlite3.Row
+    # Take an online WAL-safe snapshot of existing databases before migration.
+    exists = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='codes'").fetchone()
+    if exists:
+        try:
+            backup_sqlite(DB_PATH)
+        except Exception as exc:
+            log(f"Backup periodico non riuscito: {exc}")
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA busy_timeout=20000")
     con.execute(
@@ -211,6 +224,19 @@ def connect_db() -> sqlite3.Connection:
         )
         """
     )
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS source_checks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            checked_at TEXT NOT NULL,
+            source_name TEXT NOT NULL,
+            game TEXT NOT NULL,
+            status TEXT NOT NULL,
+            candidates INTEGER NOT NULL DEFAULT 0,
+            elapsed_ms INTEGER NOT NULL DEFAULT 0,
+            error TEXT DEFAULT ''
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_source_checks_name_id ON source_checks(source_name,id)")
     con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     # AION 2 in v1.1 was parsed by a very permissive word scanner. Previously saved
     # "official" results must not stay visible without being checked by the new parser.
@@ -359,12 +385,28 @@ def extract_expiry(context: str) -> str:
             return ""
         # Prefer a future date with year or month near expiry language.
         now = datetime.now()
+        has_time = bool(re.search(r"\b(?:[01]?\d|2[0-3]):[0-5]\d\b", nearby))
         for _, dt in found:
             if dt.year >= now.year - 1:
+                if not has_time:
+                    dt = dt.replace(hour=23, minute=59)
                 return dt.strftime("%Y-%m-%d %H:%M")
     except Exception:
         pass
     return ""
+
+
+def expiry_has_passed(game: str, expiry: str) -> bool:
+    """AION EU deadlines are expressed in Europe/Rome time."""
+    if not expiry:
+        return False
+    try:
+        end = datetime.strptime(expiry, "%Y-%m-%d %H:%M")
+        clock = (datetime.now(ZoneInfo("Europe/Rome")).replace(tzinfo=None)
+                 if game == GAME_AION2 else datetime.now())
+        return end <= clock
+    except ValueError:
+        return False
 
 
 def context_status(context: str) -> str:
@@ -514,6 +556,14 @@ def extract_aion_candidates_html(html: str, source: Source, page_url: str) -> li
             pos = full_text.find(line)
             status = "expired" if section_status == "expired" or context_status(line) == "expired" else "active"
             add(code, line, reward, status, pos)
+
+    if source.kind == "official":
+        for idx, label in enumerate(lines[:-1]):
+            if label.casefold().strip(": ") in {"coupon code", "gift code", "promo code"}:
+                token = lines[idx + 1]
+                if looks_like_code(GAME_AION2, token, label):
+                    add(token, label + " " + token, reward_window(lines, idx + 1),
+                        "active", full_text.find(token))
 
     return list(candidates.values())
 
@@ -737,7 +787,12 @@ def discover_crawl_links(base_url: str, raw_html: str, link_hint: str = "") -> l
 
 def fetch_page_source(session: requests.Session, source: Source) -> tuple[list[Candidate], int]:
     resp = http_get(session, source.url)
-    return extract_candidates_html(source.game, resp.text, source, resp.url), 1
+    found = extract_candidates_html(source.game, resp.text, source, resp.url)
+    # A soft-404 / cookie wall returning HTTP 200 is NOT reliable evidence
+    # that codes previously listed by a tracker have gone away.
+    if source.kind == "secondary" and not found and not plausible_tracker_page(resp.text, source.game):
+        raise ValueError("Pagina tracker non riconoscibile: assenza codici non verificabile")
+    return found, 1
 
 
 def fetch_crawl_source(session: requests.Session, source: Source) -> tuple[list[Candidate], int]:
@@ -994,8 +1049,7 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
 
         if item["expires_at"]:
             try:
-                exp = datetime.strptime(item["expires_at"], "%Y-%m-%d %H:%M")
-                if exp < datetime.now():
+                if expiry_has_passed(item["game"], item["expires_at"]):
                     item["status"] = "expired"
             except ValueError:
                 pass
@@ -1104,7 +1158,7 @@ def upsert_candidates(con: sqlite3.Connection, merged: dict[tuple[str, str], dic
                 status = row["status"]
         if expires:
             try:
-                if datetime.strptime(expires, "%Y-%m-%d %H:%M") <= datetime.now():
+                if expiry_has_passed(item["game"], expires):
                     status = "expired"
             except ValueError:
                 pass
@@ -1189,85 +1243,156 @@ def update_missing_codes(
 
 
 def expire_stored_codes(con: sqlite3.Connection) -> int:
-    """Apply explicit expiry even when all sources are temporarily inaccessible."""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    cur = con.execute(
-        "UPDATE codes SET status='expired' WHERE status='active' AND "
-        "expires_at != '' AND expires_at <= ?", (now,)
-    )
-    con.commit()
-    return cur.rowcount
+    """Enforce explicit deadlines with the appropriate game clock."""
+    ids = [(row["id"],) for row in con.execute(
+        "SELECT id, game, expires_at FROM codes WHERE status='active' AND expires_at!=''"
+    ) if expiry_has_passed(row["game"], row["expires_at"])]
+    if ids:
+        con.executemany("UPDATE codes SET status='expired' WHERE id=?", ids)
+        con.commit()
+    return len(ids)
 
 
 def run_check(cfg: Optional[dict] = None) -> dict:
-    cfg = cfg or load_config()
-    session = build_http_session()
+    """Skip overlapping manual/scheduled scans, preserving notifications and DB state."""
+    with operation_lock(DATA_DIR, "scan") as acquired:
+        if not acquired:
+            return {
+                "ok_sources": 0, "failed_sources": 0, "failures": [],
+                "candidates": 0, "inserted": 0, "stale_marked": 0,
+                "expired_marked": 0, "new_rows": [], "notify_rows": [],
+                "notify_rows_pc": [], "notify_rows_phone": [],
+                "skipped": True, "reason": "Controllo gia' in corso su un'altra istanza",
+            }
+        return _run_check_unlocked(cfg)
 
+
+def _run_check_unlocked(cfg: Optional[dict] = None) -> dict:
+    cfg = cfg or load_config()
     all_candidates: list[Candidate] = []
-    ok = 0
-    failed = []
+    failures: list[str] = []
     successful_source_names: set[str] = set()
+    details: list[tuple[str, str, str, int, int, str]] = []
+
+    # At most one concurrent request group per host, and only three workers.
+    # A separate Session per source avoids thread-shared requests.Session state.
+    host_locks: dict[str, threading.Lock] = {}
     for source in SOURCES:
-        try:
-            if source.mode == "page":
-                found, _ = fetch_page_source(session, source)
-            elif source.mode == "crawl":
-                found, _ = fetch_crawl_source(session, source)
-            elif source.mode == "reddit":
-                found, _ = fetch_reddit_source(session, source, cfg)
-            else:
-                continue
-            all_candidates.extend(found)
-            ok += 1
-            successful_source_names.add(source.name)
-            log(f"OK {source.name}: {len(found)} candidati")
-        except Exception as exc:
-            failed.append(f"{source.name}: {exc}")
-            log(f"ERRORE {source.name}: {exc}")
+        host = urlparse(source.url).hostname or ("reddit.com" if source.mode == "reddit" else source.name)
+        host_locks.setdefault(host.lower(), threading.Lock())
+
+    def scan_one(source: Source) -> tuple[list[Candidate], int]:
+        host = (urlparse(source.url).hostname or
+                ("reddit.com" if source.mode == "reddit" else source.name)).lower()
+        with host_locks[host]:
+            with build_http_session() as session:
+                if source.mode == "page":
+                    return fetch_page_source(session, source)
+                if source.mode == "crawl":
+                    return fetch_crawl_source(session, source)
+                if source.mode == "reddit":
+                    return fetch_reddit_source(session, source, cfg)
+                raise ValueError(f"Modalita' fonte non supportata: {source.mode}")
+
+    started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    with ThreadPoolExecutor(max_workers=MAX_SCAN_WORKERS) as executor:
+        pending = {executor.submit(scan_one, source): (source, time.monotonic())
+                   for source in SOURCES}
+        for future in as_completed(pending):
+            source, start_clock = pending[future]
+            elapsed = int((time.monotonic() - start_clock) * 1000)
+            try:
+                found, _ = future.result()
+                all_candidates.extend(found)
+                successful_source_names.add(source.name)
+                details.append((started_at, source.name, source.game, len(found), elapsed, ""))
+                log(f"OK {source.name}: {len(found)} candidati")
+            except Exception as exc:
+                message = f"{source.name}: {exc}"
+                failures.append(message)
+                details.append((started_at, source.name, source.game, 0, elapsed, str(exc)[:500]))
+                log(f"ERRORE {message}")
 
     merged = merge_candidates(all_candidates)
     con = connect_db()
-    inserted, new_rows = upsert_candidates(con, merged)
-    stale_marked = update_missing_codes(con, merged, successful_source_names)
-    expired_marked = expire_stored_codes(con)
-    con.execute(
-        "INSERT INTO checks (checked_at, ok_sources, failed_sources, candidates, error_summary) VALUES (?, ?, ?, ?, ?)",
-        (
-            datetime.now().astimezone().isoformat(timespec="seconds"), ok, len(failed), len(merged),
-            " | ".join(failed)[:4000],
-        ),
-    )
-    con.commit()
+    try:
+        inserted, new_rows = upsert_candidates(con, merged)
+        stale_marked = update_missing_codes(con, merged, successful_source_names)
+        expired_marked = expire_stored_codes(con)
+        for checked_at, name, game, count, elapsed, error in details:
+            con.execute(
+                "INSERT INTO source_checks(checked_at, source_name, game, status, candidates, elapsed_ms, error)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (checked_at, name, game, "error" if error else "ok", count, elapsed, error),
+            )
+        # Keep diagnostics bounded on long-lived installations.
+        con.execute("DELETE FROM source_checks WHERE id NOT IN "
+                    "(SELECT id FROM source_checks ORDER BY id DESC LIMIT 3000)")
+        con.execute(
+            "INSERT INTO checks (checked_at, ok_sources, failed_sources, candidates, error_summary) VALUES (?, ?, ?, ?, ?)",
+            (started_at, len(successful_source_names), len(failures), len(merged),
+             " | ".join(failures)[:4000]),
+        )
+        con.commit()
 
-    threshold = int(cfg.get("notify_min_score", 85))
-    base_sql = "SELECT * FROM codes WHERE used=0 AND status='active' AND score>=?"
-    pc_rows: list[sqlite3.Row] = []
-    phone_rows: list[sqlite3.Row] = []
-    # Never alert from a historical DB row which was not seen in THIS scan.
-    # This also avoids old bogus AION 2 records triggering on an upgrade.
-    if cfg.get("notify_pc"):
-        pc_rows = [r for r in con.execute(base_sql + " AND notified_pc=0 ORDER BY score DESC, first_seen DESC", (threshold,))
-                   if (r["game"], r["normalized"]) in merged]
-    if cfg.get("notify_phone") and cfg.get("ntfy_topic"):
-        phone_rows = [r for r in con.execute(base_sql + " AND notified_phone=0 ORDER BY score DESC, first_seen DESC", (threshold,))
-                      if (r["game"], r["normalized"]) in merged]
+        threshold = int(cfg.get("notify_min_score", 85))
+        base_sql = "SELECT * FROM codes WHERE used=0 AND status='active' AND score>=?"
+        pc_rows: list[sqlite3.Row] = []
+        phone_rows: list[sqlite3.Row] = []
+        if cfg.get("notify_pc"):
+            pc_rows = [r for r in con.execute(base_sql + " AND notified_pc=0 ORDER BY score DESC, first_seen DESC", (threshold,))
+                       if (r["game"], r["normalized"]) in merged]
+        if cfg.get("notify_phone") and cfg.get("ntfy_topic"):
+            phone_rows = [r for r in con.execute(base_sql + " AND notified_phone=0 ORDER BY score DESC, first_seen DESC", (threshold,))
+                          if (r["game"], r["normalized"]) in merged]
+    finally:
+        con.close()
 
     union = {r["id"]: r for r in pc_rows}
     union.update({r["id"]: r for r in phone_rows})
-    con.close()
     return {
-        "ok_sources": ok,
-        "failed_sources": len(failed),
-        "failures": failed,
-        "candidates": len(merged),
-        "inserted": inserted,
-        "stale_marked": stale_marked,
-        "expired_marked": expired_marked,
-        "new_rows": new_rows,
-        "notify_rows": list(union.values()),
-        "notify_rows_pc": pc_rows,
-        "notify_rows_phone": phone_rows,
+        "ok_sources": len(successful_source_names),
+        "failed_sources": len(failures), "failures": failures,
+        "candidates": len(merged), "inserted": inserted,
+        "stale_marked": stale_marked, "expired_marked": expired_marked,
+        "new_rows": new_rows, "notify_rows": list(union.values()),
+        "notify_rows_pc": pc_rows, "notify_rows_phone": phone_rows,
+        "skipped": False,
     }
+
+def deliver_notifications(result: dict, cfg: dict) -> dict:
+    """Serialize delivery and re-check flags under a cross-process lock.
+
+    Failures leave flags unset for a later eligible scan. A crash after a provider
+    accepts a notification but before commit can still cause one retry.
+    """
+    delivered = {"pc": 0, "phone": 0}
+    with operation_lock(DATA_DIR, "notifications", timeout=5) as acquired:
+        if not acquired:
+            log("Notifiche rimandate: un'altra istanza le sta inviando")
+            return delivered
+        for channel in ("pc", "phone"):
+            incoming = result.get("notify_rows_" + channel, [])
+            if not incoming:
+                continue
+            con = connect_db()
+            try:
+                column = "notified_pc" if channel == "pc" else "notified_phone"
+                eligible = []
+                for row in incoming:
+                    fresh = con.execute("SELECT * FROM codes WHERE id=?", (row["id"],)).fetchone()
+                    if fresh is not None and not fresh[column] and not fresh["used"] and fresh["status"] == "active":
+                        eligible.append(fresh)
+                ok = (notify_pc(eligible) if channel == "pc"
+                      else notify_phone(eligible, cfg)) if eligible else False
+                if ok:
+                    con.executemany(f"UPDATE codes SET {column}=1 WHERE id=?",
+                                    [(r["id"],) for r in eligible])
+                    con.commit()
+                    delivered[channel] = len(eligible)
+            finally:
+                con.close()
+    return delivered
 
 
 def notify_pc(rows: list[sqlite3.Row]) -> bool:
@@ -1429,7 +1554,7 @@ def remove_daily_task() -> tuple[bool, str]:
 
 def gui_main() -> None:
     import tkinter as tk
-    from tkinter import ttk, messagebox
+    from tkinter import ttk, messagebox, filedialog
     import secrets
 
     cfg = load_config()
@@ -1446,6 +1571,8 @@ def gui_main() -> None:
     show_unverified = tk.BooleanVar(value=bool(cfg.get("show_unverified", False)))
     show_archived = tk.BooleanVar(value=False)
     game_filter = tk.StringVar(value="Tutti")
+    search_var = tk.StringVar(value="")
+    order = {"column": "", "desc": False}
 
     top = ttk.Frame(root, padding=10)
     top.pack(fill="x")
@@ -1463,12 +1590,16 @@ def gui_main() -> None:
     ttk.Button(controls, text="Segna non valido", command=lambda: mark_selected("invalid")).pack(side="left", padx=3)
     ttk.Button(controls, text="Fonti", command=lambda: show_sources_selected()).pack(side="left", padx=3)
     ttk.Button(controls, text="Impostazioni", command=lambda: open_settings()).pack(side="right")
+    ttk.Button(controls, text="Stato fonti", command=lambda: show_source_health()).pack(side="right", padx=5)
+    ttk.Button(controls, text="Backup", command=lambda: show_backups()).pack(side="right", padx=5)
 
     filters = ttk.Frame(root, padding=(10, 0, 10, 8))
     filters.pack(fill="x")
     ttk.Label(filters, text="Gioco:").pack(side="left")
     combo = ttk.Combobox(filters, state="readonly", width=20, textvariable=game_filter, values=["Tutti"] + GAMES)
     combo.pack(side="left", padx=(5, 14))
+    ttk.Label(filters, text="Cerca:").pack(side="left")
+    ttk.Entry(filters, textvariable=search_var, width=19).pack(side="left", padx=(5, 12))
     ttk.Checkbutton(filters, text="Mostra usati", variable=show_used, command=lambda: refresh()).pack(side="left", padx=5)
     ttk.Checkbutton(filters, text="Mostra da verificare", variable=show_unverified, command=lambda: refresh()).pack(side="left", padx=5)
     ttk.Checkbutton(filters, text="Mostra storico/scaduti", variable=show_archived, command=lambda: refresh()).pack(side="left", padx=5)
@@ -1483,15 +1614,15 @@ def gui_main() -> None:
     ttk.Button(bulk_controls, text="Ripristina usati",
                command=lambda: mark_selected("restore")).pack(side="right")
 
-    cols = ("game", "code", "status", "reward", "verify", "expires", "seen", "sources")
+    cols = ("game", "code", "status", "reward", "verify", "expires", "seen", "last", "sources")
     tree = ttk.Treeview(root, columns=cols, show="headings", selectmode="extended")
     headings = {
         "game": "Gioco", "code": "Codice", "status": "Stato", "reward": "Ricompensa", "verify": "Verifica",
-        "expires": "Scadenza", "seen": "Prima rilevazione", "sources": "Fonti",
+        "expires": "Scadenza (IT AION)", "seen": "Prima rilevazione", "last": "Ultima vista", "sources": "Fonti",
     }
-    widths = {"game": 110, "code": 170, "status": 130, "reward": 310, "verify": 185, "expires": 130, "seen": 135, "sources": 60}
+    widths = {"game": 110, "code": 170, "status": 130, "reward": 310, "verify": 185, "expires": 145, "seen": 135, "last": 135, "sources": 60}
     for c in cols:
-        tree.heading(c, text=headings[c])
+        tree.heading(c, text=headings[c], command=lambda col=c: sort_by(col))
         tree.column(c, width=widths[c], anchor="w")
     tree.pack(fill="both", expand=True, padx=10)
     tree.tag_configure("official", background="#e8f5e9")
@@ -1542,6 +1673,61 @@ def gui_main() -> None:
         con.close()
         return row
 
+    def show_backups():
+        window = tk.Toplevel(root)
+        window.title("Backup e ripristino")
+        window.geometry("540x180")
+        frame = ttk.Frame(window, padding=16)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Copie locali dello storico codici; le ultime sette sono conservate.").pack(pady=10)
+
+        def create():
+            with operation_lock(DATA_DIR, "scan") as allowed:
+                if not allowed:
+                    messagebox.showwarning(APP_NAME, "Scansione in corso.", parent=window)
+                    return
+                try:
+                    path = backup_sqlite(DB_PATH, force=True)
+                    messagebox.showinfo(APP_NAME, f"Backup salvato: {path}", parent=window)
+                except Exception as exc:
+                    messagebox.showerror(APP_NAME, str(exc), parent=window)
+
+        ttk.Button(frame, text="Crea backup", command=create).pack(side="left", padx=8)
+        ttk.Button(frame, text="Chiudi", command=window.destroy).pack(side="right")
+
+    def show_source_health():
+        con = connect_db()
+        try:
+            data = con.execute(
+                "SELECT a.* FROM source_checks a WHERE id=("
+                "SELECT MAX(id) FROM source_checks WHERE source_name=a.source_name)"
+                " ORDER BY game, source_name"
+            ).fetchall()
+        finally:
+            con.close()
+        window = tk.Toplevel(root)
+        window.title("Diagnostica fonti")
+        window.geometry("1010x440")
+        columns = ("gioco", "fonte", "stato", "codici", "durata", "data", "errore")
+        table = ttk.Treeview(window, columns=columns, show="headings")
+        for col, width in zip(columns, (120, 240, 75, 70, 65, 175, 240)):
+            table.heading(col, text=col.capitalize())
+            table.column(col, width=width)
+        table.pack(fill="both", expand=True, padx=10, pady=10)
+        for row in data:
+            table.insert("", "end", values=(
+                row["game"], row["source_name"], row["status"],
+                row["candidates"], row["elapsed_ms"], row["checked_at"][:19], row["error"]
+            ))
+        ttk.Button(window, text="Chiudi", command=window.destroy).pack(pady=5)
+
+    def sort_by(col):
+        if order["column"] == col:
+            order["desc"] = not order["desc"]
+        else:
+            order["column"], order["desc"] = col, False
+        refresh()
+
     def refresh():
         for i in tree.get_children():
             tree.delete(i)
@@ -1554,11 +1740,21 @@ def gui_main() -> None:
         if game_filter.get() != "Tutti":
             sql += " AND game=?"
             params.append(game_filter.get())
+        if search_var.get().strip():
+            sql += " AND (instr(lower(code), lower(?)) > 0 OR instr(lower(rewards), lower(?)) > 0)"
+            params.extend([search_var.get().strip()] * 2)
         if not show_archived.get():
             sql += " AND status='active'"
         if not show_unverified.get():
             sql += " AND (score>=85 OR status!='active')"
-        sql += " ORDER BY used ASC, CASE WHEN status='active' THEN 0 ELSE 1 END, score DESC, first_seen DESC"
+        columns = {"game": "game", "code": "code", "status": "status",
+                   "reward": "rewards", "verify": "score", "expires": "expires_at",
+                   "seen": "first_seen", "last": "last_seen", "sources": "source_count"}
+        col = columns.get(order["column"])
+        if col:
+            sql += " ORDER BY " + col + (" DESC" if order["desc"] else " ASC")
+        else:
+            sql += " ORDER BY used ASC, CASE WHEN status='active' THEN 0 ELSE 1 END, score DESC, first_seen DESC"
         rows = con.execute(sql, params).fetchall()
         con.close()
         for r in rows:
@@ -1580,7 +1776,7 @@ def gui_main() -> None:
             display_status = {"active": "Segnalato (non garantito)", "expired": "Scaduto", "stale": "Non più rilevato",
                               "review": "Da riverificare", "invalid": "Non valido"}.get(r["status"], r["status"])
             tree.insert("", "end", iid=str(r["id"]), values=(
-                r["game"], r["code"], display_status, r["rewards"] or "—", r["confidence"], r["expires_at"] or "—", seen, r["source_count"],
+                r["game"], r["code"], display_status, r["rewards"] or "—", r["confidence"], r["expires_at"] or "—", seen, (r["last_seen"] or "").replace("T", " ")[:16], r["source_count"],
             ), tags=(tag,))
         status_var.set(f"{len(rows)} codici visibili. Database: {DB_PATH}")
         update_selection_count()
@@ -1688,11 +1884,10 @@ def gui_main() -> None:
                 cfg2 = load_config()
                 pc_rows = result["notify_rows_pc"]
                 phone_rows = result["notify_rows_phone"]
-                if pc_rows and notify_pc(pc_rows):
-                    mark_channel_notified(pc_rows, "pc")
-                if phone_rows and notify_phone(phone_rows, cfg2):
-                    mark_channel_notified(phone_rows, "phone")
-                msg = f"Controllo completato: {result['ok_sources']} fonti OK, {result['inserted']} nuovi codici"
+                if not result.get("skipped"):
+                    deliver_notifications(result, cfg2)
+                msg = ("Controllo gia' in corso" if result.get("skipped") else
+                       f"Controllo completato: {result['ok_sources']} fonti OK, {result['inserted']} nuovi codici")
                 if result.get("stale_marked"):
                     msg += f", {result['stale_marked']} non più rilevati nascosti"
                 if result["failed_sources"]:
@@ -1785,6 +1980,7 @@ def gui_main() -> None:
         frm.columnconfigure(1, weight=1)
 
     combo.bind("<<ComboboxSelected>>", lambda e: refresh())
+    search_var.trace_add("write", lambda *_: refresh())
     tree.bind("<Double-1>", lambda e: copy_selected())
     tree.bind("<<TreeviewSelect>>", update_selection_count)
     tree.bind("<Control-a>", select_all_shortcut)
@@ -1797,6 +1993,7 @@ def gui_main() -> None:
 def cli_main() -> int:
     parser = argparse.ArgumentParser(description=APP_NAME)
     parser.add_argument("--version", action="store_true", help="Mostra la versione senza aprire GUI/database")
+    parser.add_argument("--backup", action="store_true", help="Backup immediato")
     parser.add_argument("--game", choices=GAMES, help="Controlla solo un gioco")
     parser.add_argument("--report-json", type=Path, help="Salva rapporto della scansione in JSON")
     parser.add_argument("--check", action="store_true", help="Controlla le fonti e aggiorna il database")
@@ -1812,6 +2009,14 @@ def cli_main() -> int:
 
     cfg = load_config()
     connect_db().close()
+
+    if args.backup:
+        with operation_lock(DATA_DIR, "scan", timeout=5) as acquired:
+            if not acquired:
+                print("Backup non disponibile: scansione in corso")
+                return 3
+            print("Backup:", backup_sqlite(DB_PATH, force=True))
+        return 0
 
     if args.install_task:
         ok, msg = install_daily_task(cfg.get("schedule_time", "08:00"))
@@ -1831,18 +2036,13 @@ def cli_main() -> int:
             summary["game_filter"] = args.game or "all"
             args.report_json.parent.mkdir(parents=True, exist_ok=True)
             args.report_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-        if args.notify:
-            pc_rows = result["notify_rows_pc"]
-            phone_rows = result["notify_rows_phone"]
-            if pc_rows and notify_pc(pc_rows):
-                mark_channel_notified(pc_rows, "pc")
-            if phone_rows and notify_phone(phone_rows, cfg):
-                mark_channel_notified(phone_rows, "phone")
+        if args.notify and not result.get("skipped"):
+            deliver_notifications(result, cfg)
         if not args.headless:
             print(json.dumps({k: v for k, v in result.items() if not k.startswith("notify_rows") and k != "new_rows"}, ensure_ascii=False, indent=2))
         # If all sources failed, exit nonzero: otherwise a CI scan looks green
         # while having inspected nothing. Partial failure remains reportable.
-        return 2 if result["ok_sources"] == 0 else 0
+        return 3 if result.get("skipped") else (2 if result["ok_sources"] == 0 else 0)
 
     if not args.headless:
         gui_main()

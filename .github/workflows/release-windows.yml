@@ -1,0 +1,42 @@
+name: Publish versioned Windows release
+on:
+  push:
+    tags:
+      - 'v*'
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pytest
+      - name: Regression suite
+        run: python -m pytest -q
+      - name: Build executable
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name GameCodeSentinel app.py
+      - name: Smoke test executable
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path "dist/GameCodeSentinel.exe").Path
+          $p = Start-Process -FilePath $exe -ArgumentList "--version" -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "EXE launch failed" }
+      - name: Verify version and checksum
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path app.py -Pattern '^APP_VERSION = "([^"]+)"').Matches.Groups[1].Value
+          if ("v$version" -ne "$env:GITHUB_REF_NAME") { throw "Tag and app version mismatch" }
+          $hash = (Get-FileHash "dist/GameCodeSentinel.exe" -Algorithm SHA256).Hash.ToLower()
+          "$hash  GameCodeSentinel.exe" | Set-Content -Path "dist/SHA256SUMS.txt" -Encoding ascii
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release create "$env:GITHUB_REF_NAME" "dist/GameCodeSentinel.exe" "dist/SHA256SUMS.txt" --title "GameCode Sentinel $env:GITHUB_REF_NAME" --generate-notes --verify-tag

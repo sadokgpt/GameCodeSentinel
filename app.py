@@ -97,6 +97,7 @@ SOURCES = [
     Source(GAME_ANIIMO, "Reddit r/AniimoGuide", "", "community", "reddit", subreddit="AniimoGuide"),
 
     Source(GAME_AION2, "AION 2 - PURPLE Lounge ufficiale", "https://lounge.plaync.com/tag/13519", "official", "crawl", "/feed/"),
+    Source(GAME_AION2, "AION 2 - Official coupon news", "https://lounge.plaync.com/feed/82955", "official", "page"),
     Source(GAME_AION2, "Steam - Annunci ufficiali AION 2", "https://steamcommunity.com/app/3393110/announcements/", "official", "page"),
     Source(GAME_AION2, "AION 2 - Notice ufficiali", "https://aion2.plaync.com/en-us/board/notice/list", "official", "crawl", "/board/notice/view"),
     Source(GAME_AION2, "NCSOFT - News", "https://about.ncsoft.com/en/news", "official", "crawl", "/en/news/article/aion2"),

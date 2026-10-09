@@ -1,4 +1,4 @@
-GAMECODE SENTINEL 1.3.3
+GAMECODE SENTINEL 1.4.0
 =====================
 
 OBIETTIVO
@@ -215,3 +215,20 @@ Ctrl+A o Seleziona tutti visibili seleziona tutte le righe attualmente mostrate.
 Segna usati nasconde i codici senza cancellarli.
 Mostra usati + Ripristina usati permette di annullare la marcatura.
 I codici Non valido non vengono ripristinati automaticamente.
+
+
+VERSIONE 1.4.0 - NOVITA'
+----------------------
+- Ricerca codice/ricompensa nella finestra principale; clic sulle colonne per ordinare.
+- Colonna Ultima vista e finestra Stato fonti con errori e tempi per ogni fonte.
+- Scansioni parallele limitate con protezione dai controlli simultanei.
+- Controllo di pagine tracker vuote o non riconoscibili per ridurre falsi scaduti.
+- Backup SQLite automatici ogni 24 ore, mantenendo fino a 7 snapshot consistenti.
+- Pulsante Backup per creare una copia; da terminale: python app.py --backup.
+- Notifiche con controllo anti-duplicazione fra istanze e verifica dello stato corrente.
+- Scadenze senza ora interpretate fino a fine giornata e AION EU confrontato su ora italiana.
+- Build Windows v1.4.0 e checksum pubblicati in Actions; workflow di release su tag.
+
+Il programma non elimina i codici marcati usati. Prima di aggiornare fai sempre una
+copia di %LOCALAPPDATA%\\GameCodeSentinel\\codes.db o usa il nuovo pulsante Backup.
+La funzione di ripristino automatico con pulsante non e' ancora disponibile.

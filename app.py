@@ -1681,7 +1681,6 @@ def gui_main() -> None:
                     messagebox.showerror(APP_NAME, str(exc), parent=window)
 
         ttk.Button(frame, text="Crea backup", command=create).pack(side="left", padx=8)
-        ttk.Button(frame, text="Ripristina", command=lambda: messagebox.showinfo(APP_NAME, "Ripristino disponibile tramite backup verificato.", parent=window)).pack(side="left", padx=8)
         ttk.Button(frame, text="Chiudi", command=window.destroy).pack(side="right")
 
     def show_source_health():

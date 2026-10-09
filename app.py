@@ -29,7 +29,7 @@ except Exception:
     search_dates = None
 
 APP_NAME = "GameCodeSentinel"
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (+local Windows code tracker; contact: local-user)"
 REQUEST_TIMEOUT = 18
 MAX_CRAWL_LINKS = 14
@@ -1334,6 +1334,30 @@ def mark_channel_notified(rows: list[sqlite3.Row], channel: str) -> None:
     con.close()
 
 
+def update_code_state(con: sqlite3.Connection, row_ids: list[int], action: str) -> int:
+    """Update redeemed codes in one transaction while preserving code history."""
+    if action not in {"used", "invalid", "restore"}:
+        raise ValueError("Azione sui codici non valida")
+    if any(type(row_id) is not int or row_id <= 0 for row_id in row_ids):
+        raise ValueError("ID codice non valido")
+    ids = list(dict.fromkeys(row_ids))
+    if not ids:
+        return 0
+    placeholders = ",".join("?" for _ in ids)
+    if action == "used":
+        sql = f"UPDATE codes SET used=1 WHERE used=0 AND id IN ({placeholders})"
+    elif action == "invalid":
+        sql = (f"UPDATE codes SET status='invalid', used=1 WHERE "
+               f"(status!='invalid' OR used=0) AND id IN ({placeholders})")
+    else:
+        # Restore only genuinely redeemed codes. Never reactivate invalid ones.
+        sql = (f"UPDATE codes SET used=0 WHERE used=1 AND status!='invalid' "
+               f"AND id IN ({placeholders})")
+    with con:
+        cursor = con.execute(sql, ids)
+    return cursor.rowcount
+
+
 def redeem_url_for(game: str, code: str) -> Optional[str]:
     if game == GAME_GENSHIN:
         return "https://genshin.hoyoverse.com/en/gift?code=" + quote_plus(code)
@@ -1435,7 +1459,7 @@ def gui_main() -> None:
     check_btn.pack(side="left", padx=(0, 6))
     ttk.Button(controls, text="Copia codice", command=lambda: copy_selected()).pack(side="left", padx=3)
     ttk.Button(controls, text="Riscatta / istruzioni", command=lambda: redeem_selected()).pack(side="left", padx=3)
-    ttk.Button(controls, text="Segna come usato", command=lambda: mark_selected("used")).pack(side="left", padx=3)
+    ttk.Button(controls, text="Segna usati", command=lambda: mark_selected("used")).pack(side="left", padx=3)
     ttk.Button(controls, text="Segna non valido", command=lambda: mark_selected("invalid")).pack(side="left", padx=3)
     ttk.Button(controls, text="Fonti", command=lambda: show_sources_selected()).pack(side="left", padx=3)
     ttk.Button(controls, text="Impostazioni", command=lambda: open_settings()).pack(side="right")
@@ -1449,8 +1473,18 @@ def gui_main() -> None:
     ttk.Checkbutton(filters, text="Mostra da verificare", variable=show_unverified, command=lambda: refresh()).pack(side="left", padx=5)
     ttk.Checkbutton(filters, text="Mostra storico/scaduti", variable=show_archived, command=lambda: refresh()).pack(side="left", padx=5)
 
+    bulk_controls = ttk.Frame(root, padding=(10, 0, 10, 8))
+    bulk_controls.pack(fill="x")
+    ttk.Label(bulk_controls, text="Selezione: Ctrl+clic, Maiusc+clic oppure Ctrl+A").pack(side="left")
+    ttk.Button(bulk_controls, text="Seleziona tutti visibili",
+               command=lambda: select_all_visible()).pack(side="left", padx=(12, 4))
+    ttk.Button(bulk_controls, text="Deseleziona",
+               command=lambda: clear_selection()).pack(side="left", padx=4)
+    ttk.Button(bulk_controls, text="Ripristina usati",
+               command=lambda: mark_selected("restore")).pack(side="right")
+
     cols = ("game", "code", "status", "reward", "verify", "expires", "seen", "sources")
-    tree = ttk.Treeview(root, columns=cols, show="headings", selectmode="browse")
+    tree = ttk.Treeview(root, columns=cols, show="headings", selectmode="extended")
     headings = {
         "game": "Gioco", "code": "Codice", "status": "Stato", "reward": "Ricompensa", "verify": "Verifica",
         "expires": "Scadenza", "seen": "Prima rilevazione", "sources": "Fonti",
@@ -1473,13 +1507,34 @@ def gui_main() -> None:
     bottom = ttk.Frame(root, padding=10)
     bottom.pack(fill="x")
     ttk.Label(bottom, textvariable=status_var).pack(side="left")
+    selection_var = tk.StringVar(value="Selezionati: 0")
+    ttk.Label(bottom, textvariable=selection_var).pack(side="left", padx=(12, 0))
     ttk.Label(bottom, text="Verde=ufficiale · Azzurro=confermato · Giallo=da verificare", foreground="#555").pack(side="right")
 
+    def selected_ids() -> list[int]:
+        return [int(item) for item in tree.selection()]
+
     def selected_id() -> Optional[int]:
-        sel = tree.selection()
-        if not sel:
-            return None
-        return int(sel[0])
+        ids = selected_ids()
+        return ids[0] if len(ids) == 1 else None
+
+    def update_selection_count(event=None):
+        selection_var.set(f"Selezionati: {len(tree.selection())}")
+
+    def select_all_visible():
+        items = tree.get_children("")
+        if items:
+            tree.selection_set(*items)
+            tree.focus(items[0])
+        update_selection_count()
+
+    def clear_selection():
+        tree.selection_remove(*tree.selection())
+        update_selection_count()
+
+    def select_all_shortcut(event):
+        select_all_visible()
+        return "break"
 
     def get_row(row_id: int):
         con = connect_db()
@@ -1528,11 +1583,12 @@ def gui_main() -> None:
                 r["game"], r["code"], display_status, r["rewards"] or "—", r["confidence"], r["expires_at"] or "—", seen, r["source_count"],
             ), tags=(tag,))
         status_var.set(f"{len(rows)} codici visibili. Database: {DB_PATH}")
+        update_selection_count()
 
     def copy_selected():
         rid = selected_id()
         if rid is None:
-            messagebox.showinfo(APP_NAME, "Seleziona un codice.")
+            messagebox.showinfo(APP_NAME, "Seleziona un solo codice.")
             return
         r = get_row(rid)
         root.clipboard_clear()
@@ -1540,22 +1596,38 @@ def gui_main() -> None:
         status_var.set(f"Copiato: {r['code']}")
 
     def mark_selected(action: str):
-        rid = selected_id()
-        if rid is None:
-            messagebox.showinfo(APP_NAME, "Seleziona un codice.")
+        ids = selected_ids()
+        if not ids:
+            messagebox.showinfo(APP_NAME, "Seleziona almeno un codice.")
+            return
+        actions = {
+            "used": ("segnare come usati", "Segnati come usati"),
+            "invalid": ("segnare come non validi", "Segnati come non validi"),
+            "restore": ("ripristinare come non usati", "Ripristinati"),
+        }
+        if action not in actions:
+            raise ValueError("Azione sui codici non valida")
+        prompt, result_label = actions[action]
+        if len(ids) > 1 and not messagebox.askyesno(
+            APP_NAME,
+            f"Vuoi {prompt} i {len(ids)} codici selezionati?\n"
+            "L'operazione non elimina i codici dal database.",
+            parent=root,
+        ):
             return
         con = connect_db()
-        if action == "used":
-            con.execute("UPDATE codes SET used=1 WHERE id=?", (rid,))
-        else:
-            con.execute("UPDATE codes SET status='invalid', used=1 WHERE id=?", (rid,))
-        con.commit(); con.close()
+        try:
+            changed = update_code_state(con, ids, action)
+        finally:
+            con.close()
         refresh()
+        note = " I codici non validi non vengono riattivati." if action == "restore" else ""
+        status_var.set(f"{result_label}: {changed} codici.{note}")
 
     def show_sources_selected():
         rid = selected_id()
         if rid is None:
-            messagebox.showinfo(APP_NAME, "Seleziona un codice.")
+            messagebox.showinfo(APP_NAME, "Seleziona un solo codice.")
             return
         r = get_row(rid)
         try:
@@ -1590,7 +1662,7 @@ def gui_main() -> None:
     def redeem_selected():
         rid = selected_id()
         if rid is None:
-            messagebox.showinfo(APP_NAME, "Seleziona un codice.")
+            messagebox.showinfo(APP_NAME, "Seleziona un solo codice.")
             return
         r = get_row(rid)
         if r["status"] != "active":
@@ -1714,6 +1786,8 @@ def gui_main() -> None:
 
     combo.bind("<<ComboboxSelected>>", lambda e: refresh())
     tree.bind("<Double-1>", lambda e: copy_selected())
+    tree.bind("<<TreeviewSelect>>", update_selection_count)
+    tree.bind("<Control-a>", select_all_shortcut)
     check_btn.config(command=do_check)
     refresh()
     root.after(750, do_check)  # first launch refreshes current codes immediately

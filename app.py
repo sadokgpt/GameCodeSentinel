@@ -553,6 +553,14 @@ def extract_aion_candidates_html(html: str, source: Source, page_url: str) -> li
             status = "expired" if section_status == "expired" or context_status(line) == "expired" else "active"
             add(code, line, reward, status, pos)
 
+    if source.kind == "official":
+        for idx, label in enumerate(lines[:-1]):
+            if label.casefold().strip(": ") in {"coupon code", "gift code", "promo code"}:
+                token = lines[idx + 1]
+                if looks_like_code(GAME_AION2, token, label):
+                    add(token, label + " " + token, reward_window(lines, idx + 1),
+                        "active", full_text.find(token))
+
     return list(candidates.values())
 
 

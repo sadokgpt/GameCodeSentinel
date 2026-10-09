@@ -133,6 +133,7 @@ def ensure_dirs() -> None:
 def log(msg: str) -> None:
     ensure_dirs()
     stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with LOG_PATH.open("a", encoding="utf-8") as f:
         f.write(f"[{stamp}] {msg}\n")
 
@@ -162,11 +163,13 @@ def connect_db() -> sqlite3.Connection:
     ensure_dirs()
     con = sqlite3.connect(DB_PATH, timeout=20)
     con.row_factory = sqlite3.Row
-    # Preserve an online WAL-safe backup before touching schema or records.
-    try:
-        backup_sqlite(DB_PATH)
-    except Exception as exc:
-        log(f"Backup periodico non riuscito: {exc}")
+    # Take an online WAL-safe snapshot of existing databases before migration.
+    exists = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='codes'").fetchone()
+    if exists:
+        try:
+            backup_sqlite(DB_PATH)
+        except Exception as exc:
+            log(f"Backup periodico non riuscito: {exc}")
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA busy_timeout=20000")
     con.execute(

@@ -381,12 +381,28 @@ def extract_expiry(context: str) -> str:
             return ""
         # Prefer a future date with year or month near expiry language.
         now = datetime.now()
+        has_time = bool(re.search(r"\b(?:[01]?\d|2[0-3]):[0-5]\d\b", nearby))
         for _, dt in found:
             if dt.year >= now.year - 1:
+                if not has_time:
+                    dt = dt.replace(hour=23, minute=59)
                 return dt.strftime("%Y-%m-%d %H:%M")
     except Exception:
         pass
     return ""
+
+
+def expiry_has_passed(game: str, expiry: str) -> bool:
+    """AION EU deadlines are expressed in Europe/Rome time."""
+    if not expiry:
+        return False
+    try:
+        end = datetime.strptime(expiry, "%Y-%m-%d %H:%M")
+        clock = (datetime.now(ZoneInfo("Europe/Rome")).replace(tzinfo=None)
+                 if game == GAME_AION2 else datetime.now())
+        return end <= clock
+    except ValueError:
+        return False
 
 
 def context_status(context: str) -> str:
@@ -1021,8 +1037,7 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
 
         if item["expires_at"]:
             try:
-                exp = datetime.strptime(item["expires_at"], "%Y-%m-%d %H:%M")
-                if exp < datetime.now():
+                if expiry_has_passed(item["game"], item["expires_at"]):
                     item["status"] = "expired"
             except ValueError:
                 pass
@@ -1131,7 +1146,7 @@ def upsert_candidates(con: sqlite3.Connection, merged: dict[tuple[str, str], dic
                 status = row["status"]
         if expires:
             try:
-                if datetime.strptime(expires, "%Y-%m-%d %H:%M") <= datetime.now():
+                if expiry_has_passed(item["game"], expires):
                     status = "expired"
             except ValueError:
                 pass
@@ -1216,14 +1231,14 @@ def update_missing_codes(
 
 
 def expire_stored_codes(con: sqlite3.Connection) -> int:
-    """Apply explicit expiry even when all sources are temporarily inaccessible."""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    cur = con.execute(
-        "UPDATE codes SET status='expired' WHERE status='active' AND "
-        "expires_at != '' AND expires_at <= ?", (now,)
-    )
-    con.commit()
-    return cur.rowcount
+    """Enforce explicit deadlines with the appropriate game clock."""
+    ids = [(row["id"],) for row in con.execute(
+        "SELECT id, game, expires_at FROM codes WHERE status='active' AND expires_at!=''"
+    ) if expiry_has_passed(row["game"], row["expires_at"])]
+    if ids:
+        con.executemany("UPDATE codes SET status='expired' WHERE id=?", ids)
+        con.commit()
+    return len(ids)
 
 
 def run_check(cfg: Optional[dict] = None) -> dict:

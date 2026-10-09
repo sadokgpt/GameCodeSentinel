@@ -1559,6 +1559,8 @@ def gui_main() -> None:
     show_unverified = tk.BooleanVar(value=bool(cfg.get("show_unverified", False)))
     show_archived = tk.BooleanVar(value=False)
     game_filter = tk.StringVar(value="Tutti")
+    search_var = tk.StringVar(value="")
+    order = {"column": "", "desc": False}
 
     top = ttk.Frame(root, padding=10)
     top.pack(fill="x")
@@ -1582,6 +1584,8 @@ def gui_main() -> None:
     ttk.Label(filters, text="Gioco:").pack(side="left")
     combo = ttk.Combobox(filters, state="readonly", width=20, textvariable=game_filter, values=["Tutti"] + GAMES)
     combo.pack(side="left", padx=(5, 14))
+    ttk.Label(filters, text="Cerca:").pack(side="left")
+    ttk.Entry(filters, textvariable=search_var, width=19).pack(side="left", padx=(5, 12))
     ttk.Checkbutton(filters, text="Mostra usati", variable=show_used, command=lambda: refresh()).pack(side="left", padx=5)
     ttk.Checkbutton(filters, text="Mostra da verificare", variable=show_unverified, command=lambda: refresh()).pack(side="left", padx=5)
     ttk.Checkbutton(filters, text="Mostra storico/scaduti", variable=show_archived, command=lambda: refresh()).pack(side="left", padx=5)
@@ -1596,15 +1600,15 @@ def gui_main() -> None:
     ttk.Button(bulk_controls, text="Ripristina usati",
                command=lambda: mark_selected("restore")).pack(side="right")
 
-    cols = ("game", "code", "status", "reward", "verify", "expires", "seen", "sources")
+    cols = ("game", "code", "status", "reward", "verify", "expires", "seen", "last", "sources")
     tree = ttk.Treeview(root, columns=cols, show="headings", selectmode="extended")
     headings = {
         "game": "Gioco", "code": "Codice", "status": "Stato", "reward": "Ricompensa", "verify": "Verifica",
-        "expires": "Scadenza", "seen": "Prima rilevazione", "sources": "Fonti",
+        "expires": "Scadenza (IT AION)", "seen": "Prima rilevazione", "last": "Ultima vista", "sources": "Fonti",
     }
-    widths = {"game": 110, "code": 170, "status": 130, "reward": 310, "verify": 185, "expires": 130, "seen": 135, "sources": 60}
+    widths = {"game": 110, "code": 170, "status": 130, "reward": 310, "verify": 185, "expires": 145, "seen": 135, "last": 135, "sources": 60}
     for c in cols:
-        tree.heading(c, text=headings[c])
+        tree.heading(c, text=headings[c], command=lambda col=c: sort_by(col))
         tree.column(c, width=widths[c], anchor="w")
     tree.pack(fill="both", expand=True, padx=10)
     tree.tag_configure("official", background="#e8f5e9")
@@ -1655,6 +1659,13 @@ def gui_main() -> None:
         con.close()
         return row
 
+    def sort_by(col):
+        if order["column"] == col:
+            order["desc"] = not order["desc"]
+        else:
+            order["column"], order["desc"] = col, False
+        refresh()
+
     def refresh():
         for i in tree.get_children():
             tree.delete(i)
@@ -1667,11 +1678,21 @@ def gui_main() -> None:
         if game_filter.get() != "Tutti":
             sql += " AND game=?"
             params.append(game_filter.get())
+        if search_var.get().strip():
+            sql += " AND (instr(lower(code), lower(?)) > 0 OR instr(lower(rewards), lower(?)) > 0)"
+            params.extend([search_var.get().strip()] * 2)
         if not show_archived.get():
             sql += " AND status='active'"
         if not show_unverified.get():
             sql += " AND (score>=85 OR status!='active')"
-        sql += " ORDER BY used ASC, CASE WHEN status='active' THEN 0 ELSE 1 END, score DESC, first_seen DESC"
+        columns = {"game": "game", "code": "code", "status": "status",
+                   "reward": "rewards", "verify": "score", "expires": "expires_at",
+                   "seen": "first_seen", "last": "last_seen", "sources": "source_count"}
+        col = columns.get(order["column"])
+        if col:
+            sql += " ORDER BY " + col + (" DESC" if order["desc"] else " ASC")
+        else:
+            sql += " ORDER BY used ASC, CASE WHEN status='active' THEN 0 ELSE 1 END, score DESC, first_seen DESC"
         rows = con.execute(sql, params).fetchall()
         con.close()
         for r in rows:
@@ -1693,7 +1714,7 @@ def gui_main() -> None:
             display_status = {"active": "Segnalato (non garantito)", "expired": "Scaduto", "stale": "Non più rilevato",
                               "review": "Da riverificare", "invalid": "Non valido"}.get(r["status"], r["status"])
             tree.insert("", "end", iid=str(r["id"]), values=(
-                r["game"], r["code"], display_status, r["rewards"] or "—", r["confidence"], r["expires_at"] or "—", seen, r["source_count"],
+                r["game"], r["code"], display_status, r["rewards"] or "—", r["confidence"], r["expires_at"] or "—", seen, (r["last_seen"] or "").replace("T", " ")[:16], r["source_count"],
             ), tags=(tag,))
         status_var.set(f"{len(rows)} codici visibili. Database: {DB_PATH}")
         update_selection_count()
@@ -1898,6 +1919,7 @@ def gui_main() -> None:
         frm.columnconfigure(1, weight=1)
 
     combo.bind("<<ComboboxSelected>>", lambda e: refresh())
+    search_var.trace_add("write", lambda *_: refresh())
     tree.bind("<Double-1>", lambda e: copy_selected())
     tree.bind("<<TreeviewSelect>>", update_selection_count)
     tree.bind("<Control-a>", select_all_shortcut)

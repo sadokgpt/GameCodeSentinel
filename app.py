@@ -296,9 +296,15 @@ def connect_db() -> sqlite3.Connection:
     ).fetchone()
     if reviewed is None:
         legacy = []
-        for row in con.execute(
-            "SELECT id, sources_json FROM codes WHERE status='active' AND used=0"
-        ).fetchall():
+        # Very old v1 databases may not yet have modern columns. Do not break
+        # their startup or interfere with the existing v1 notification migration.
+        if {"id", "status", "used", "sources_json"} <= existing_cols:
+            legacy_rows = con.execute(
+                "SELECT id, sources_json FROM codes WHERE status='active' AND used=0"
+            ).fetchall()
+        else:
+            legacy_rows = []
+        for row in legacy_rows:
             try:
                 sources = json.loads(row["sources_json"] or "[]")
             except (ValueError, TypeError):

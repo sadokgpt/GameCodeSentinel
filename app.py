@@ -15,7 +15,10 @@ import webbrowser
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from sentinel_freshness import extract_page_dates, parse_publication_time, is_old_post, age_days
+from sentinel_freshness import extract_page_dates, parse_publication_time, is_old_post, age_days, is_active_tracker_heading
+from sentinel_table import (DEFAULT_COLUMNS, DEFAULT_WIDTHS, restore_column_order,
+                            restore_column_widths, move_column, latest_post_date,
+                            is_recent_code, sort_rows_by_post_date, sources_from_row)
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Iterable, Optional
@@ -33,7 +36,7 @@ except Exception:
     search_dates = None
 
 APP_NAME = "GameCodeSentinel"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (+local Windows code tracker; contact: local-user)"
 REQUEST_TIMEOUT = 18
 MAX_CRAWL_LINKS = 14
@@ -123,6 +126,8 @@ class Candidate:
     reddit_negatives: int = 0
     published_at: str = ""
     updated_at: str = ""
+    active_listing: bool = False
+    checked_at: str = ""
 
     @property
     def normalized(self) -> str:
@@ -527,7 +532,8 @@ def extract_aion_candidates_html(html: str, source: Source, page_url: str) -> li
     )
     candidates: dict[str, Candidate] = {}
 
-    def add(token: str, context: str, reward: str, status: str, position: int = -1) -> None:
+    def add(token: str, context: str, reward: str, status: str, position: int = -1,
+            active_listing: bool = False) -> None:
         token = token.strip().strip("`'\"“”.,;:()[]{}<>")
         if not looks_like_code(GAME_AION2, token, context):
             return
@@ -541,9 +547,12 @@ def extract_aion_candidates_html(html: str, source: Source, page_url: str) -> li
             game=GAME_AION2, code=token, reward=clean_reward(reward, token),
             source_name=source.name, source_url=page_url, source_kind=source.kind,
             status=status, expires_at=expiry, context=context[:500],
+            active_listing=active_listing and status == "active",
         )
         key = candidate.normalized
         old = candidates.get(key)
+        if old is not None and old.status == "active" and candidate.status == "active":
+            candidate.active_listing = candidate.active_listing or old.active_listing
         if old is None or (old.status != "active" and status == "active") or (
             old.status == status and len(candidate.reward) > len(old.reward)
         ):
@@ -559,6 +568,8 @@ def extract_aion_candidates_html(html: str, source: Source, page_url: str) -> li
         heading = tag.find_previous(["h1", "h2", "h3", "h4"])
         heading_text = heading.get_text(" ", strip=True) if heading else ""
         is_list = bool(heading_code_list.search(heading_text))
+        heading_active = is_active_tracker_heading(
+            heading_text, source_kind=source.kind, source_mode=source.mode)
         status = "expired" if re.search(r"(?i)\b(?:expired|old\s+codes|scadut[oaie]?)\b", heading_text) else "active"
         if re.search(r"(?i)\b(?:is\s+expired|code\s+expired|no\s+longer\s+valid)\b", block):
             status = "expired"
@@ -566,7 +577,7 @@ def extract_aion_candidates_html(html: str, source: Source, page_url: str) -> li
         for match in explicit.finditer(block):
             code = next(x for x in match.groups() if x)
             # Explicit statement itself must not call this code a dummy/sample.
-            add(code, block, block, status, position)
+            add(code, block, block, status, position, heading_active)
         if tag.name in {"li", "tr", "code"} and is_list:
             if tag.name == "tr":
                 cells = [c.get_text(" ", strip=True) for c in tag.find_all(["td", "th"])]
@@ -576,24 +587,28 @@ def extract_aion_candidates_html(html: str, source: Source, page_url: str) -> li
                 match = list_entry.match(block)
                 code, rest = (match.group(1), match.group(2)) if match else ("", "")
             if code and (rest or tag.name == "code"):
-                add(code, heading_text + " | " + block, rest, status, position)
+                add(code, heading_text + " | " + block, rest, status, position, heading_active)
 
     # Publisher CMS may use styled <div> rather than <p>; in this fallback the
     # *only* pattern accepted is an explicit instruction on one short text line.
     section_status = "active"
+    section_is_current_listing = False
     for idx, line in enumerate(lines):
         if len(line) > 400:
             continue
         if re.search(r"(?i)^\s*(?:expired|old|scadut[ieoa]?)\s+(?:codes?|coupons?)\b", line):
             section_status = "expired"
+            section_is_current_listing = False
         elif re.search(r"(?i)^\s*(?:active|working|new|current|valid)\s+(?:codes?|coupons?)\b", line):
             section_status = "active"
+            section_is_current_listing = is_active_tracker_heading(
+                line, source_kind=source.kind, source_mode=source.mode)
         for match in explicit.finditer(line):
             code = next(x for x in match.groups() if x)
             reward = reward_window(lines, idx)
             pos = full_text.find(line)
             status = "expired" if section_status == "expired" or context_status(line) == "expired" else "active"
-            add(code, line, reward, status, pos)
+            add(code, line, reward, status, pos, section_is_current_listing)
 
     if source.kind == "official":
         for idx, label in enumerate(lines[:-1]):
@@ -615,7 +630,8 @@ def extract_candidates_html(game: str, html: str, source: Source, page_url: str)
     text = soup.get_text("\n", strip=True)
     out: dict[str, Candidate] = {}
 
-    def add(code: str, ctx: str, reward_hint: str = "", status_override: str = "") -> None:
+    def add(code: str, ctx: str, reward_hint: str = "", status_override: str = "",
+            active_listing: bool = False) -> None:
         code = code.strip().strip("`'\"“”.,;:()[]{}<>")
         if not looks_like_code(game, code, ctx):
             return
@@ -631,8 +647,11 @@ def extract_candidates_html(game: str, html: str, source: Source, page_url: str)
             status=status_override or context_status(ctx),
             expires_at=extract_expiry(ctx),
             context=ctx[:500],
+            active_listing=active_listing and (status_override or context_status(ctx)) == "active",
         )
         prev = out.get(norm)
+        if prev is not None and prev.status == "active" and cand.status == "active":
+            cand.active_listing = cand.active_listing or prev.active_listing
         if (
             prev is None
             or (cand.status == "active" and prev.status != "active")
@@ -647,7 +666,9 @@ def extract_candidates_html(game: str, html: str, source: Source, page_url: str)
         heading_text = heading.get_text(" ", strip=True) if heading else ""
         status_override = "expired" if re.search(r"expired|scadut", heading_text, re.I) else ""
         ctx = (heading_text + " | " + (tag.parent.get_text(" ", strip=True) if tag.parent else token)).strip(" |")
-        add(token, ctx, status_override=status_override)
+        add(token, ctx, status_override=status_override,
+            active_listing=is_active_tracker_heading(heading_text,
+                source_kind=source.kind, source_mode=source.mode))
     for a in soup.find_all("a", href=True):
         href = a.get("href", "")
         try:
@@ -675,11 +696,15 @@ def extract_candidates_html(game: str, html: str, source: Source, page_url: str)
             status_override = "expired"
         elif re.search(r"active|working|current|valid|available", heading_text, re.I):
             status_override = "active"
+        in_current_list = is_active_tracker_heading(
+            heading_text, source_kind=source.kind, source_mode=source.mode)
         for m in explicit.finditer(block_text):
-            add(m.group(1), f"{status_override} {heading_text} | {block_text}", status_override=status_override)
+            add(m.group(1), f"{status_override} {heading_text} | {block_text}",
+                status_override=status_override, active_listing=in_current_list)
         lm = line_pat.match(block_text)
         if lm:
-            add(lm.group(1), f"{status_override} code {heading_text} | {block_text}", lm.group(2), status_override)
+            add(lm.group(1), f"{status_override} code {heading_text} | {block_text}",
+                lm.group(2), status_override, in_current_list)
 
     # Table rows are common on code trackers. Preserve Active/Expired section context.
     for tr in soup.find_all("tr"):
@@ -697,27 +722,37 @@ def extract_candidates_html(game: str, html: str, source: Source, page_url: str)
         token = cells[0].strip().strip("`'\"“”")
         row_ctx = "code " + heading_text + " | " + row_text
         if looks_like_code(game, token, row_ctx):
-            add(token, row_ctx, " | ".join(cells[1:]), status_override)
+            add(token, row_ctx, " | ".join(cells[1:]), status_override,
+                is_active_tracker_heading(heading_text,
+                    source_kind=source.kind, source_mode=source.mode))
 
     # Parse line-by-line so an Expired/Active heading is carried into list entries.
     section_status = "active"
+    section_is_current_listing = False
     text_lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     for idx, line in enumerate(text_lines):
         if not line or len(line) > 340:
             continue
         if re.search(r"\b(expired|scadut[ioa]?|non validi|old codes)\b", line, re.I):
             section_status = "expired"
+            section_is_current_listing = False
         elif re.search(r"\b(active|working|new|current|live|valid|codici attivi|available)\b.*\b(code|codes|codici|coupon)", line, re.I):
             section_status = "active"
+            section_is_current_listing = is_active_tracker_heading(
+                line, source_kind=source.kind, source_mode=source.mode)
 
         nearby = " | ".join(text_lines[idx:idx+10])
         reward_nearby = reward_window(text_lines, idx)
         for m in explicit.finditer(line):
-            add(m.group(1), f"{section_status} {nearby}", reward_hint=reward_nearby, status_override=section_status)
+            add(m.group(1), f"{section_status} {nearby}", reward_hint=reward_nearby,
+                status_override="expired" if context_status(line) == "expired" else section_status,
+                active_listing=section_is_current_listing)
 
         m = line_pat.match(line)
         if m:
-            add(m.group(1), f"{section_status} code {line}", m.group(2), section_status)
+            add(m.group(1), f"{section_status} code {line}", m.group(2),
+                "expired" if context_status(line) == "expired" else section_status,
+                section_is_current_listing)
 
     # Fallback for strongly code-shaped tokens near code/reward wording.
     # Deliberately excludes ordinary TitleCase words to reduce false positives.

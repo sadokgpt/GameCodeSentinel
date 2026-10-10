@@ -287,6 +287,35 @@ def connect_db() -> sqlite3.Connection:
                 "WHERE id=?", (row["id"],)
             )
         con.execute("INSERT INTO meta(key, value) VALUES('aion_code_shape_review_v131','1')")
+
+    # Version 1.5 and older did not store post publication timestamps.
+    # Existing active entries with no dated evidence must be re-reviewed,
+    # otherwise a repost from 2022 can remain 'confirmed' forever.
+    reviewed = con.execute(
+        "SELECT value FROM meta WHERE key='post_provenance_review_v160'"
+    ).fetchone()
+    if reviewed is None:
+        legacy = []
+        for row in con.execute(
+            "SELECT id, sources_json FROM codes WHERE status='active' AND used=0"
+        ).fetchall():
+            try:
+                sources = json.loads(row["sources_json"] or "[]")
+            except (ValueError, TypeError):
+                sources = []
+            if not any(isinstance(src, dict) and src.get("published_at") for src in sources):
+                legacy.append((row["id"],))
+        if legacy:
+            con.commit()
+            # Consistent backup BEFORE quarantine; historical rows are preserved.
+            backup_sqlite(DB_PATH, force=True)
+            con.executemany(
+                "UPDATE codes SET status='review', score=0, "
+                "confidence='STORICO PRECEDENTE / DATA POST DA RIVERIFICARE' WHERE id=?",
+                legacy,
+            )
+            log(f"Riverifica date: {len(legacy)} vecchi codici senza origine temporale")
+        con.execute("INSERT INTO meta(key, value) VALUES('post_provenance_review_v160','1')")
     con.commit()
     return con
 

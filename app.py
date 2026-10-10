@@ -1749,6 +1749,7 @@ def gui_main() -> None:
     show_used = tk.BooleanVar(value=False)
     show_unverified = tk.BooleanVar(value=bool(cfg.get("show_unverified", False)))
     show_archived = tk.BooleanVar(value=False)
+    recent_only = tk.BooleanVar(value=bool(cfg.get("recent_only", False)))
     game_filter = tk.StringVar(value="Tutti")
     search_var = tk.StringVar(value="")
     order = {"column": "", "desc": False}
@@ -1829,6 +1830,8 @@ def gui_main() -> None:
     ttk.Checkbutton(display_filters, text="Da verificare", variable=show_unverified,
                     command=lambda: refresh()).pack(side="left", padx=(0, 12))
     ttk.Checkbutton(display_filters, text="Storico e scaduti", variable=show_archived,
+                    command=lambda: refresh()).pack(side="left", padx=(0, 12))
+    ttk.Checkbutton(display_filters, text="Solo codici recenti", variable=recent_only,
                     command=lambda: refresh()).pack(side="left")
 
     bulk_controls = ttk.Frame(main)
@@ -1846,7 +1849,9 @@ def gui_main() -> None:
     table_frame.pack(fill="both", expand=True)
     table_frame.rowconfigure(0, weight=1)
     table_frame.columnconfigure(0, weight=1)
-    cols = ("game", "code", "status", "verify", "expires", "published", "seen", "last", "sources", "reward")
+    cols = DEFAULT_COLUMNS
+    saved_widths = restore_column_widths(cfg.get("table_widths"))
+    saved_columns = restore_column_order(cfg.get("table_columns"))
     tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="extended")
     headings = {
         "game": "Gioco", "code": "Codice", "status": "Stato",
@@ -1854,14 +1859,10 @@ def gui_main() -> None:
         "seen": "Prima rilevazione", "last": "Ultima vista", "sources": "Fonti",
         "reward": "Ricompensa",
     }
-    widths = {
-        "game": 125, "code": 168, "status": 165,
-        "verify": 165, "expires": 151, "published": 124, "seen": 155, "last": 155, "sources": 62,
-        "reward": 270,
-    }
     for c in cols:
         tree.heading(c, text=headings[c], command=lambda col=c: sort_by(col))
-        tree.column(c, width=widths[c], minwidth=65, anchor="w", stretch=True)
+        tree.column(c, width=saved_widths[c], minwidth=65, anchor="w", stretch=True)
+    tree.configure(displaycolumns=saved_columns)
     tree.grid(row=0, column=0, sticky="nsew")
     scrollbar_y = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
     scrollbar_y.grid(row=0, column=1, sticky="ns")
@@ -1975,11 +1976,42 @@ def gui_main() -> None:
             ))
         ttk.Button(window, text="Chiudi", command=window.destroy).pack(pady=5)
 
+    heading_drag = {"origin": None, "ignore_sort": False}
+
+    def visual_columns():
+        return restore_column_order(tree["displaycolumns"])
+
+    def header_press(event):
+        heading_drag["origin"] = (
+            tree.identify_column(event.x)
+            if tree.identify_region(event.x, event.y) == "heading" else None
+        )
+
+    def header_release(event):
+        start = heading_drag["origin"]
+        heading_drag["origin"] = None
+        if not start or tree.identify_region(event.x, event.y) != "heading":
+            return
+        target = tree.identify_column(event.x)
+        if start == target:
+            return
+        visual = visual_columns()
+        try:
+            src = visual[int(start[1:]) - 1]
+            dst = visual[int(target[1:]) - 1]
+        except (IndexError, ValueError):
+            return
+        tree.configure(displaycolumns=move_column(visual, src, dst))
+        heading_drag["ignore_sort"] = True
+        root.after_idle(lambda: heading_drag.update(ignore_sort=False))
+
     def sort_by(col):
+        if heading_drag["ignore_sort"]:
+            return
         if order["column"] == col:
             order["desc"] = not order["desc"]
         else:
-            order["column"], order["desc"] = col, False
+            order["column"], order["desc"] = col, col == "published"
         refresh()
 
     def refresh():
@@ -2011,6 +2043,10 @@ def gui_main() -> None:
             sql += " ORDER BY used ASC, CASE WHEN status='active' THEN 0 ELSE 1 END, score DESC, first_seen DESC"
         rows = con.execute(sql, params).fetchall()
         con.close()
+        if recent_only.get():
+            rows = [row for row in rows if is_recent_code(row)]
+        if order["column"] == "published":
+            rows = sort_rows_by_post_date(rows, descending=order["desc"])
         for r in rows:
             if r["status"] != "active":
                 tag = "archived"
@@ -2026,13 +2062,7 @@ def gui_main() -> None:
                 src_count = len(json.loads(r["sources_json"] or "[]"))
             except Exception:
                 src_count = r["source_count"]
-            post_dates = []
-            try:
-                post_dates = [src.get("published_at", "") for src in json.loads(r["sources_json"] or "[]")
-                              if isinstance(src, dict) and src.get("published_at")]
-            except (ValueError, TypeError):
-                pass
-            newest_post = max(post_dates, default="")
+            newest_post = latest_post_date(r)
             post_label = newest_post[:10] if newest_post else "Data non nota"
             seen = (r["first_seen"] or "").replace("T", " ")[:16]
             display_status = {"active": "Segnalato (non garantito)", "expired": "Scaduto", "stale": "Non più rilevato",
@@ -2117,7 +2147,12 @@ def gui_main() -> None:
             age = age_days(posted)
             date_label = (f"post {posted[:10]} / {age} giorni fa" if age is not None
                           else "pubblicazione non dichiarata")
-            lb.insert("end", f"[{src.get('kind','')}] {src.get('name','')} ({date_label}) — {src.get('url','')}")
+            checked = src.get("checked_at", "")
+            evidence = ("elencato in Attivi" if src.get("listed_active")
+                        else "citazione / segnalazione")
+            checked_label = f"; visto {checked[:10]}" if checked else ""
+            lb.insert("end", f"[{src.get('kind','')}] {src.get('name','')} "
+                             f"({date_label}; {evidence}{checked_label}) — {src.get('url','')}")
         def open_src():
             sel = lb.curselection()
             if not sel:
@@ -2310,10 +2345,29 @@ def gui_main() -> None:
         search_timer = root.after(240, refresh)
 
     search_var.trace_add("write", schedule_search)
-    tree.bind("<Double-1>", lambda e: copy_selected())
+    tree.bind("<Double-1>", lambda e: (
+        show_sources_selected() if tree.identify_region(e.x, e.y) == "cell" else None
+    ))
+    tree.bind("<ButtonPress-1>", header_press, add="+")
+    tree.bind("<ButtonRelease-1>", header_release, add="+")
     tree.bind("<<TreeviewSelect>>", update_selection_count)
     tree.bind("<Control-a>", select_all_shortcut)
     check_btn.config(command=do_check)
+
+    def close_and_save():
+        try:
+            stored = load_config()
+            stored["table_columns"] = list(visual_columns())
+            stored["table_widths"] = {
+                col: max(65, min(850, int(tree.column(col, "width")))) for col in cols
+            }
+            stored["recent_only"] = bool(recent_only.get())
+            save_config(stored)
+        except Exception as exc:
+            log(f"Impossibile salvare il layout della tabella: {exc}")
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", close_and_save)
     refresh()
     root.after(750, do_check)  # first launch refreshes current codes immediately
     root.mainloop()

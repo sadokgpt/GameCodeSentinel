@@ -1,10 +1,10 @@
-# GameCode Sentinel 1.5.0
+# GameCode Sentinel 1.6.0
 
 Windows tracker for **AION 2**, **Genshin Impact** and **Aniimo** redemption codes. Local SQLite database; notifications are optional. Code detection is probabilistic: a published string is not proof it can be redeemed. Version 1.3.2 rejects common AION 2 reward names accidentally tagged as codes and quarantines previously stored suspicious Reddit entries.
 
 ## Windows (without Python)
 
-After a successful GitHub Actions run, download the `GameCodeSentinel-Windows-v1.5.0` artifact from the **Build Windows EXE** workflow, unzip, and run `GameCodeSentinel.exe`. Windows SmartScreen may warn for an unsigned executable. Only install software you trust.
+After a successful GitHub Actions run, download the `GameCodeSentinel-Windows-v1.6.0` artifact from the **Build Windows EXE** workflow, unzip, and run `GameCodeSentinel.exe`. Windows SmartScreen may warn for an unsigned executable. Only install software you trust.
 
 ## From source
 
@@ -29,6 +29,17 @@ Do not commit `config.json`, `codes.db`, `.env`, notification topics, logs or cr
 ## Notes
 
 The license has not been selected. Public visibility is not a license granting reuse. Credits and previous technical audit are in `AUDIT_V1.1.txt` and `AUDIT_V1.2.txt`.
+
+## Novità 1.6.0 — filtro anti-post vecchi, con date verificabili
+
+- Ogni codice ricavato da un articolo HTML conserva la data **originale** del post quando disponibile (`article:published_time`, `datePublished` JSON-LD o `time` esplicito). Se la pagina riporta anche `dateModified`, resta separata: aggiornare una pagina **non prova** che un codice sia nuovo.
+- Reddit JSON usa `created_utc` dei post; i codici nei commenti utilizzano **la data del singolo commento** anziché quella della discussione. Il fallback RSS usa il campo `published` della voce.
+- Soglie prudenziali di **anzianità della segnalazione**: 30 giorni per Genshin Impact, 90 per AION 2 e Aniimo. Superata la soglia, una segnalazione **non vale come conferma corrente**; se non ci sono altre fonti recenti o senza data ma presenti in elenco corrente, il codice va in **Da riverificare** (non dichiarato scaduto). Sono soglie di priorità, **non durate ufficiali dei codici**.
+- Nuova colonna **Data post** e data di pubblicazione per ciascuna fonte nel dettaglio. **Data non nota** significa che la pagina non ha fornito metadati utilizzabili; non significa codice recente.
+- Nessun codice viene riattivato se era già scaduto soltanto perché riappare in un vecchio post. Codici vecchi e dati preesistenti restano conservati nel database, ma non generano nuovi avvisi in assenza di riscontri sufficienti.
+- Ulteriori test con casi di post Reddit vecchi, commenti recenti, articoli aggiornati a distanza di anni e scadenze pregresse.
+
+**Esiste un validatore rapido affidabile?** Non è stato integrato alcun validatore esterno non ufficiale. Il [supporto HoYoverse](https://support.hoyoverse.com/hc/en-us/articles/51005644306585-Why-am-I-getting-an-error-message-that-my-redemption-code-is-invalid-or-has-already-been-used) segnala che la validità può dipendere anche da regione, scadenza e utilizzo già effettuato e avverte sui software di terze parti che riscattano i codici. La data di pubblicazione, la presenza su una pagina e il punteggio di confidenza **non certificano** la riscattabilità sull'account dell'utente. Il riscatto resta assistito sul [sito ufficiale](https://genshin.hoyoverse.com/en/gift).
 
 ## Novità 1.5.0 — interfaccia desktop e riscatto assistito
 

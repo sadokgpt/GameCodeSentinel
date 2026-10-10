@@ -5,6 +5,7 @@ on:
     paths:
       - 'app.py'
       - 'sentinel_ui.py'
+      - 'sentinel_freshness.py'
       - 'requirements.txt'
       - 'tests/**'
       - '.github/workflows/build-windows.yml'
@@ -52,7 +53,7 @@ jobs:
       - name: Upload tested EXE and checksum
         uses: actions/upload-artifact@v7
         with:
-          name: GameCodeSentinel-Windows-v1.5.0
+          name: GameCodeSentinel-Windows-v1.6.0
           path: |
             dist/GameCodeSentinel.exe
             dist/SHA256SUMS.txt

@@ -555,7 +555,8 @@ def extract_aion_candidates_html(html: str, source: Source, page_url: str) -> li
             candidate.active_listing = candidate.active_listing or old.active_listing
         if old is None or (old.status != "active" and status == "active") or (
             old.status == status and len(candidate.reward) > len(old.reward)
-        ):
+        ) or (old is not None and old.status == "active" and
+              candidate.status == "active" and candidate.active_listing and not old.active_listing):
             if old is not None and not candidate.expires_at:
                 candidate.expires_at = old.expires_at
             candidates[key] = candidate
@@ -656,6 +657,8 @@ def extract_candidates_html(game: str, html: str, source: Source, page_url: str)
             prev is None
             or (cand.status == "active" and prev.status != "active")
             or (cand.status == prev.status and len(cand.reward) > len(prev.reward))
+            or (cand.status == "active" and prev.status == "active"
+                and cand.active_listing and not prev.active_listing)
         ):
             out[norm] = cand
 
@@ -858,18 +861,28 @@ def discover_crawl_links(base_url: str, raw_html: str, link_hint: str = "") -> l
     return links
 
 
-def enrich_with_page_dates(candidates: list[Candidate], html: str) -> list[Candidate]:
-    """Attribute the actual fetched page date, never the scanner's download time."""
+def enrich_with_page_dates(
+    candidates: list[Candidate], html: str, source: Optional[Source] = None
+) -> list[Candidate]:
+    """Stamp this retrieval but never mistake retrieval/edit date for publication."""
     published, updated = extract_page_dates(html)
+    checked = datetime.now(timezone.utc).isoformat(timespec="seconds")
     for cand in candidates:
         cand.published_at = published
         cand.updated_at = updated
+        cand.checked_at = checked
+        if (source is not None and source.kind in {"official", "secondary"}
+                and cand.status == "active" and not published
+                and not cand.active_listing):
+            # An undated static news/article mention is not evidence of a
+            # *recent* code. A tracker may still assert it is on its live list.
+            cand.status = "review"
     return candidates
 
 
 def fetch_page_source(session: requests.Session, source: Source) -> tuple[list[Candidate], int]:
     resp = http_get(session, source.url)
-    found = enrich_with_page_dates(extract_candidates_html(source.game, resp.text, source, resp.url), resp.text)
+    found = enrich_with_page_dates(extract_candidates_html(source.game, resp.text, source, resp.url), resp.text, source)
     # A soft-404 / cookie wall returning HTTP 200 is NOT reliable evidence
     # that codes previously listed by a tracker have gone away.
     if source.kind == "secondary" and not found and not plausible_tracker_page(resp.text, source.game):
@@ -882,12 +895,12 @@ def fetch_crawl_source(session: requests.Session, source: Source) -> tuple[list[
     first_html = resp.text
     links = discover_crawl_links(resp.url, first_html, source.link_hint)
 
-    all_candidates = enrich_with_page_dates(extract_candidates_html(source.game, first_html, source, resp.url), first_html)
+    all_candidates = enrich_with_page_dates(extract_candidates_html(source.game, first_html, source, resp.url), first_html, source)
     fetched = 1
     for href in links:
         try:
             r = http_get(session, href)
-            all_candidates.extend(enrich_with_page_dates(extract_candidates_html(source.game, r.text, source, r.url), r.text))
+            all_candidates.extend(enrich_with_page_dates(extract_candidates_html(source.game, r.text, source, r.url), r.text, source))
             fetched += 1
             time.sleep(0.12)
         except Exception as exc:
@@ -987,6 +1000,7 @@ def fetch_reddit_source(session: requests.Session, source: Source, cfg: dict) ->
             posted = parse_publication_time(data.get("created_utc"))
             for cand in found:
                 cand.published_at = posted
+                cand.checked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 if not posted and cand.status == "active":
                     cand.status = "review"
 
@@ -1003,6 +1017,7 @@ def fetch_reddit_source(session: requests.Session, source: Source, cfg: dict) ->
                         extracted = extract_candidates_html(source.game, comment_html, source, post_url)
                         for cand in extracted:
                             cand.published_at = comment_date
+                            cand.checked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
                             if not comment_date and cand.status == "active":
                                 cand.status = "review"
                         comment_found.extend(extracted)
@@ -1045,6 +1060,7 @@ def fetch_reddit_source(session: requests.Session, source: Source, cfg: dict) ->
             for cand in from_atom:
                 cand.published_at = parse_publication_time(atom_pub.text if atom_pub is not None else "")
                 cand.updated_at = parse_publication_time(atom_mod.text if atom_mod is not None else "")
+                cand.checked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 if not cand.published_at and cand.status == "active":
                     cand.status = "review"
             candidates.extend(from_atom)
@@ -1086,6 +1102,8 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
             item["sources"].append({
                 "name": c.source_name, "url": c.source_url, "kind": c.source_kind,
                 "published_at": c.published_at, "updated_at": c.updated_at,
+                "listed_active": bool(c.active_listing and c.status == "active"),
+                "checked_at": c.checked_at,
             })
 
         rank = rank_map.get(c.source_kind, 0)
@@ -1105,7 +1123,7 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
         # A dated old mention must not be interpreted as a fresh confirmation.
         # It remains visible in the history; its status becomes "review", not expired.
         evidence_status = ("review" if c.status == "active" and
-                           is_old_post(c.game, c.published_at) else c.status)
+                           is_old_post(c.game, c.published_at) and not c.active_listing else c.status)
         priority = {"active": 3, "expired": 2, "review": 1}
         if state is None or priority[evidence_status] > priority[state[1]]:
             item["source_states"][c.source_name] = (c.source_kind, evidence_status)
@@ -1136,6 +1154,9 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
         kinds = list(trusted_sources.values())
         official = "official" in kinds
         source_count = len(unique_sources)
+        current_tracker_listings = sum(1 for source in item["sources"]
+                                       if source.get("listed_active")
+                                       and source.get("kind") == "secondary")
         positives = item["confirmations"]
         negatives = item["negatives"]
 
@@ -1170,6 +1191,8 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
         if negatives >= 3 and negatives > positives:
             score = min(score, 25)
             conf = "CONTESTATO / DA VERIFICARE"
+        elif current_tracker_listings and not official and score > 0:
+            conf += " · PRESENTE IN ELENCO ATTIVI (NON GARANTITO)"
 
         active_weight = 0.0
         expired_weight = 0.0
@@ -1194,6 +1217,7 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
         item["score"] = score
         item["confidence"] = conf
         item["source_count"] = source_count
+        item["current_listing_count"] = current_tracker_listings
         item.pop("source_states", None)
         item.pop("reward_rank", None)
         item.pop("code_rank", None)
@@ -1293,7 +1317,8 @@ def upsert_candidates(con: sqlite3.Connection, merged: dict[tuple[str, str], dic
         elif row["status"] in {"stale", "review"} and status == "active":
             kinds_now = {s.get("kind") for s in item["sources"]}
             reliable = "official" in kinds_now or (
-                "secondary" in kinds_now and (row["status"] == "stale" or score >= 85)
+                "secondary" in kinds_now and (row["status"] == "stale" or score >= 85
+                                              or item.get("current_listing_count", 0) > 0)
             )
             if not reliable:
                 status = row["status"]

@@ -36,7 +36,7 @@ def test_theme_is_available_without_creating_a_window():
     assert sentinel_ui.PALETTE["background"].startswith("#")
     assert callable(sentinel_ui.apply_theme)
     assert callable(sentinel_ui.metric_card)
-    assert app.APP_VERSION == "1.6.0"
+    assert app.APP_VERSION == "1.7.0"
 
 
 def test_reward_is_last_column_and_last_displayed_value():
@@ -53,7 +53,13 @@ def test_reward_is_last_column_and_last_displayed_value():
                 for target in node.targets)
     ]
     assert len(columns) == 1
-    assert ast.literal_eval(columns[0].value)[-1] == "reward"
+    # Since 1.7 the default layout is defined in a pure, testable module.
+    if isinstance(columns[0].value, ast.Name):
+        assert columns[0].value.id == "DEFAULT_COLUMNS"
+        visible_columns = app.DEFAULT_COLUMNS
+    else:
+        visible_columns = ast.literal_eval(columns[0].value)
+    assert visible_columns[-1] == "reward"
 
     inserts = [
         call for call in ast.walk(gui_tree)
@@ -64,5 +70,5 @@ def test_reward_is_last_column_and_last_displayed_value():
     assert len(inserts) == 1
     values = next(kw.value for kw in inserts[0].keywords if kw.arg == "values")
     assert isinstance(values, ast.Tuple)
-    assert len(values.elts) == len(ast.literal_eval(columns[0].value))
+    assert len(values.elts) == len(visible_columns)
     assert ast.unparse(values.elts[-1]) == "r['rewards'] or '—'"

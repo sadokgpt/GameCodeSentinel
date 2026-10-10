@@ -15,7 +15,10 @@ import webbrowser
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from sentinel_freshness import extract_page_dates, parse_publication_time, is_old_post, age_days
+from sentinel_freshness import extract_page_dates, parse_publication_time, is_old_post, age_days, is_active_tracker_heading
+from sentinel_table import (DEFAULT_COLUMNS, DEFAULT_WIDTHS, restore_column_order,
+                            restore_column_widths, move_column, latest_post_date,
+                            is_recent_code, sort_rows_by_post_date, sources_from_row)
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Iterable, Optional
@@ -33,7 +36,7 @@ except Exception:
     search_dates = None
 
 APP_NAME = "GameCodeSentinel"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (+local Windows code tracker; contact: local-user)"
 REQUEST_TIMEOUT = 18
 MAX_CRAWL_LINKS = 14
@@ -123,6 +126,8 @@ class Candidate:
     reddit_negatives: int = 0
     published_at: str = ""
     updated_at: str = ""
+    active_listing: bool = False
+    checked_at: str = ""
 
     @property
     def normalized(self) -> str:
@@ -527,7 +532,8 @@ def extract_aion_candidates_html(html: str, source: Source, page_url: str) -> li
     )
     candidates: dict[str, Candidate] = {}
 
-    def add(token: str, context: str, reward: str, status: str, position: int = -1) -> None:
+    def add(token: str, context: str, reward: str, status: str, position: int = -1,
+            active_listing: bool = False) -> None:
         token = token.strip().strip("`'\"“”.,;:()[]{}<>")
         if not looks_like_code(GAME_AION2, token, context):
             return
@@ -541,12 +547,16 @@ def extract_aion_candidates_html(html: str, source: Source, page_url: str) -> li
             game=GAME_AION2, code=token, reward=clean_reward(reward, token),
             source_name=source.name, source_url=page_url, source_kind=source.kind,
             status=status, expires_at=expiry, context=context[:500],
+            active_listing=active_listing and status == "active",
         )
         key = candidate.normalized
         old = candidates.get(key)
+        if old is not None and old.status == "active" and candidate.status == "active":
+            candidate.active_listing = candidate.active_listing or old.active_listing
         if old is None or (old.status != "active" and status == "active") or (
             old.status == status and len(candidate.reward) > len(old.reward)
-        ):
+        ) or (old is not None and old.status == "active" and
+              candidate.status == "active" and candidate.active_listing and not old.active_listing):
             if old is not None and not candidate.expires_at:
                 candidate.expires_at = old.expires_at
             candidates[key] = candidate
@@ -559,6 +569,8 @@ def extract_aion_candidates_html(html: str, source: Source, page_url: str) -> li
         heading = tag.find_previous(["h1", "h2", "h3", "h4"])
         heading_text = heading.get_text(" ", strip=True) if heading else ""
         is_list = bool(heading_code_list.search(heading_text))
+        heading_active = is_active_tracker_heading(
+            heading_text, source_kind=source.kind, source_mode=source.mode)
         status = "expired" if re.search(r"(?i)\b(?:expired|old\s+codes|scadut[oaie]?)\b", heading_text) else "active"
         if re.search(r"(?i)\b(?:is\s+expired|code\s+expired|no\s+longer\s+valid)\b", block):
             status = "expired"
@@ -566,7 +578,7 @@ def extract_aion_candidates_html(html: str, source: Source, page_url: str) -> li
         for match in explicit.finditer(block):
             code = next(x for x in match.groups() if x)
             # Explicit statement itself must not call this code a dummy/sample.
-            add(code, block, block, status, position)
+            add(code, block, block, status, position, heading_active)
         if tag.name in {"li", "tr", "code"} and is_list:
             if tag.name == "tr":
                 cells = [c.get_text(" ", strip=True) for c in tag.find_all(["td", "th"])]
@@ -576,24 +588,28 @@ def extract_aion_candidates_html(html: str, source: Source, page_url: str) -> li
                 match = list_entry.match(block)
                 code, rest = (match.group(1), match.group(2)) if match else ("", "")
             if code and (rest or tag.name == "code"):
-                add(code, heading_text + " | " + block, rest, status, position)
+                add(code, heading_text + " | " + block, rest, status, position, heading_active)
 
     # Publisher CMS may use styled <div> rather than <p>; in this fallback the
     # *only* pattern accepted is an explicit instruction on one short text line.
     section_status = "active"
+    section_is_current_listing = False
     for idx, line in enumerate(lines):
         if len(line) > 400:
             continue
         if re.search(r"(?i)^\s*(?:expired|old|scadut[ieoa]?)\s+(?:codes?|coupons?)\b", line):
             section_status = "expired"
+            section_is_current_listing = False
         elif re.search(r"(?i)^\s*(?:active|working|new|current|valid)\s+(?:codes?|coupons?)\b", line):
             section_status = "active"
+            section_is_current_listing = is_active_tracker_heading(
+                line, source_kind=source.kind, source_mode=source.mode)
         for match in explicit.finditer(line):
             code = next(x for x in match.groups() if x)
             reward = reward_window(lines, idx)
             pos = full_text.find(line)
             status = "expired" if section_status == "expired" or context_status(line) == "expired" else "active"
-            add(code, line, reward, status, pos)
+            add(code, line, reward, status, pos, section_is_current_listing)
 
     if source.kind == "official":
         for idx, label in enumerate(lines[:-1]):
@@ -615,7 +631,8 @@ def extract_candidates_html(game: str, html: str, source: Source, page_url: str)
     text = soup.get_text("\n", strip=True)
     out: dict[str, Candidate] = {}
 
-    def add(code: str, ctx: str, reward_hint: str = "", status_override: str = "") -> None:
+    def add(code: str, ctx: str, reward_hint: str = "", status_override: str = "",
+            active_listing: bool = False) -> None:
         code = code.strip().strip("`'\"“”.,;:()[]{}<>")
         if not looks_like_code(game, code, ctx):
             return
@@ -631,12 +648,17 @@ def extract_candidates_html(game: str, html: str, source: Source, page_url: str)
             status=status_override or context_status(ctx),
             expires_at=extract_expiry(ctx),
             context=ctx[:500],
+            active_listing=active_listing and (status_override or context_status(ctx)) == "active",
         )
         prev = out.get(norm)
+        if prev is not None and prev.status == "active" and cand.status == "active":
+            cand.active_listing = cand.active_listing or prev.active_listing
         if (
             prev is None
             or (cand.status == "active" and prev.status != "active")
             or (cand.status == prev.status and len(cand.reward) > len(prev.reward))
+            or (cand.status == "active" and prev.status == "active"
+                and cand.active_listing and not prev.active_listing)
         ):
             out[norm] = cand
 
@@ -647,7 +669,9 @@ def extract_candidates_html(game: str, html: str, source: Source, page_url: str)
         heading_text = heading.get_text(" ", strip=True) if heading else ""
         status_override = "expired" if re.search(r"expired|scadut", heading_text, re.I) else ""
         ctx = (heading_text + " | " + (tag.parent.get_text(" ", strip=True) if tag.parent else token)).strip(" |")
-        add(token, ctx, status_override=status_override)
+        add(token, ctx, status_override=status_override,
+            active_listing=is_active_tracker_heading(heading_text,
+                source_kind=source.kind, source_mode=source.mode))
     for a in soup.find_all("a", href=True):
         href = a.get("href", "")
         try:
@@ -675,11 +699,15 @@ def extract_candidates_html(game: str, html: str, source: Source, page_url: str)
             status_override = "expired"
         elif re.search(r"active|working|current|valid|available", heading_text, re.I):
             status_override = "active"
+        in_current_list = is_active_tracker_heading(
+            heading_text, source_kind=source.kind, source_mode=source.mode)
         for m in explicit.finditer(block_text):
-            add(m.group(1), f"{status_override} {heading_text} | {block_text}", status_override=status_override)
+            add(m.group(1), f"{status_override} {heading_text} | {block_text}",
+                status_override=status_override, active_listing=in_current_list)
         lm = line_pat.match(block_text)
         if lm:
-            add(lm.group(1), f"{status_override} code {heading_text} | {block_text}", lm.group(2), status_override)
+            add(lm.group(1), f"{status_override} code {heading_text} | {block_text}",
+                lm.group(2), status_override, in_current_list)
 
     # Table rows are common on code trackers. Preserve Active/Expired section context.
     for tr in soup.find_all("tr"):
@@ -697,27 +725,37 @@ def extract_candidates_html(game: str, html: str, source: Source, page_url: str)
         token = cells[0].strip().strip("`'\"“”")
         row_ctx = "code " + heading_text + " | " + row_text
         if looks_like_code(game, token, row_ctx):
-            add(token, row_ctx, " | ".join(cells[1:]), status_override)
+            add(token, row_ctx, " | ".join(cells[1:]), status_override,
+                is_active_tracker_heading(heading_text,
+                    source_kind=source.kind, source_mode=source.mode))
 
     # Parse line-by-line so an Expired/Active heading is carried into list entries.
     section_status = "active"
+    section_is_current_listing = False
     text_lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     for idx, line in enumerate(text_lines):
         if not line or len(line) > 340:
             continue
         if re.search(r"\b(expired|scadut[ioa]?|non validi|old codes)\b", line, re.I):
             section_status = "expired"
+            section_is_current_listing = False
         elif re.search(r"\b(active|working|new|current|live|valid|codici attivi|available)\b.*\b(code|codes|codici|coupon)", line, re.I):
             section_status = "active"
+            section_is_current_listing = is_active_tracker_heading(
+                line, source_kind=source.kind, source_mode=source.mode)
 
         nearby = " | ".join(text_lines[idx:idx+10])
         reward_nearby = reward_window(text_lines, idx)
         for m in explicit.finditer(line):
-            add(m.group(1), f"{section_status} {nearby}", reward_hint=reward_nearby, status_override=section_status)
+            add(m.group(1), f"{section_status} {nearby}", reward_hint=reward_nearby,
+                status_override="expired" if context_status(line) == "expired" else section_status,
+                active_listing=section_is_current_listing)
 
         m = line_pat.match(line)
         if m:
-            add(m.group(1), f"{section_status} code {line}", m.group(2), section_status)
+            add(m.group(1), f"{section_status} code {line}", m.group(2),
+                "expired" if context_status(line) == "expired" else section_status,
+                section_is_current_listing)
 
     # Fallback for strongly code-shaped tokens near code/reward wording.
     # Deliberately excludes ordinary TitleCase words to reduce false positives.
@@ -823,18 +861,28 @@ def discover_crawl_links(base_url: str, raw_html: str, link_hint: str = "") -> l
     return links
 
 
-def enrich_with_page_dates(candidates: list[Candidate], html: str) -> list[Candidate]:
-    """Attribute the actual fetched page date, never the scanner's download time."""
+def enrich_with_page_dates(
+    candidates: list[Candidate], html: str, source: Optional[Source] = None
+) -> list[Candidate]:
+    """Stamp this retrieval but never mistake retrieval/edit date for publication."""
     published, updated = extract_page_dates(html)
+    checked = datetime.now(timezone.utc).isoformat(timespec="seconds")
     for cand in candidates:
         cand.published_at = published
         cand.updated_at = updated
+        cand.checked_at = checked
+        if (source is not None and source.kind in {"official", "secondary"}
+                and cand.status == "active" and not published
+                and not cand.active_listing):
+            # An undated static news/article mention is not evidence of a
+            # *recent* code. A tracker may still assert it is on its live list.
+            cand.status = "review"
     return candidates
 
 
 def fetch_page_source(session: requests.Session, source: Source) -> tuple[list[Candidate], int]:
     resp = http_get(session, source.url)
-    found = enrich_with_page_dates(extract_candidates_html(source.game, resp.text, source, resp.url), resp.text)
+    found = enrich_with_page_dates(extract_candidates_html(source.game, resp.text, source, resp.url), resp.text, source)
     # A soft-404 / cookie wall returning HTTP 200 is NOT reliable evidence
     # that codes previously listed by a tracker have gone away.
     if source.kind == "secondary" and not found and not plausible_tracker_page(resp.text, source.game):
@@ -847,12 +895,12 @@ def fetch_crawl_source(session: requests.Session, source: Source) -> tuple[list[
     first_html = resp.text
     links = discover_crawl_links(resp.url, first_html, source.link_hint)
 
-    all_candidates = enrich_with_page_dates(extract_candidates_html(source.game, first_html, source, resp.url), first_html)
+    all_candidates = enrich_with_page_dates(extract_candidates_html(source.game, first_html, source, resp.url), first_html, source)
     fetched = 1
     for href in links:
         try:
             r = http_get(session, href)
-            all_candidates.extend(enrich_with_page_dates(extract_candidates_html(source.game, r.text, source, r.url), r.text))
+            all_candidates.extend(enrich_with_page_dates(extract_candidates_html(source.game, r.text, source, r.url), r.text, source))
             fetched += 1
             time.sleep(0.12)
         except Exception as exc:
@@ -952,6 +1000,7 @@ def fetch_reddit_source(session: requests.Session, source: Source, cfg: dict) ->
             posted = parse_publication_time(data.get("created_utc"))
             for cand in found:
                 cand.published_at = posted
+                cand.checked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 if not posted and cand.status == "active":
                     cand.status = "review"
 
@@ -968,6 +1017,7 @@ def fetch_reddit_source(session: requests.Session, source: Source, cfg: dict) ->
                         extracted = extract_candidates_html(source.game, comment_html, source, post_url)
                         for cand in extracted:
                             cand.published_at = comment_date
+                            cand.checked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
                             if not comment_date and cand.status == "active":
                                 cand.status = "review"
                         comment_found.extend(extracted)
@@ -1010,6 +1060,7 @@ def fetch_reddit_source(session: requests.Session, source: Source, cfg: dict) ->
             for cand in from_atom:
                 cand.published_at = parse_publication_time(atom_pub.text if atom_pub is not None else "")
                 cand.updated_at = parse_publication_time(atom_mod.text if atom_mod is not None else "")
+                cand.checked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 if not cand.published_at and cand.status == "active":
                     cand.status = "review"
             candidates.extend(from_atom)
@@ -1051,6 +1102,8 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
             item["sources"].append({
                 "name": c.source_name, "url": c.source_url, "kind": c.source_kind,
                 "published_at": c.published_at, "updated_at": c.updated_at,
+                "listed_active": bool(c.active_listing and c.status == "active"),
+                "checked_at": c.checked_at,
             })
 
         rank = rank_map.get(c.source_kind, 0)
@@ -1070,7 +1123,7 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
         # A dated old mention must not be interpreted as a fresh confirmation.
         # It remains visible in the history; its status becomes "review", not expired.
         evidence_status = ("review" if c.status == "active" and
-                           is_old_post(c.game, c.published_at) else c.status)
+                           is_old_post(c.game, c.published_at) and not c.active_listing else c.status)
         priority = {"active": 3, "expired": 2, "review": 1}
         if state is None or priority[evidence_status] > priority[state[1]]:
             item["source_states"][c.source_name] = (c.source_kind, evidence_status)
@@ -1101,6 +1154,9 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
         kinds = list(trusted_sources.values())
         official = "official" in kinds
         source_count = len(unique_sources)
+        current_tracker_listings = sum(1 for source in item["sources"]
+                                       if source.get("listed_active")
+                                       and source.get("kind") == "secondary")
         positives = item["confirmations"]
         negatives = item["negatives"]
 
@@ -1135,6 +1191,8 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
         if negatives >= 3 and negatives > positives:
             score = min(score, 25)
             conf = "CONTESTATO / DA VERIFICARE"
+        elif current_tracker_listings and not official and score > 0:
+            conf += " · PRESENTE IN ELENCO ATTIVI (NON GARANTITO)"
 
         active_weight = 0.0
         expired_weight = 0.0
@@ -1159,6 +1217,7 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
         item["score"] = score
         item["confidence"] = conf
         item["source_count"] = source_count
+        item["current_listing_count"] = current_tracker_listings
         item.pop("source_states", None)
         item.pop("reward_rank", None)
         item.pop("code_rank", None)
@@ -1258,7 +1317,8 @@ def upsert_candidates(con: sqlite3.Connection, merged: dict[tuple[str, str], dic
         elif row["status"] in {"stale", "review"} and status == "active":
             kinds_now = {s.get("kind") for s in item["sources"]}
             reliable = "official" in kinds_now or (
-                "secondary" in kinds_now and (row["status"] == "stale" or score >= 85)
+                "secondary" in kinds_now and (row["status"] == "stale" or score >= 85
+                                              or item.get("current_listing_count", 0) > 0)
             )
             if not reliable:
                 status = row["status"]
@@ -1689,6 +1749,7 @@ def gui_main() -> None:
     show_used = tk.BooleanVar(value=False)
     show_unverified = tk.BooleanVar(value=bool(cfg.get("show_unverified", False)))
     show_archived = tk.BooleanVar(value=False)
+    recent_only = tk.BooleanVar(value=bool(cfg.get("recent_only", False)))
     game_filter = tk.StringVar(value="Tutti")
     search_var = tk.StringVar(value="")
     order = {"column": "", "desc": False}
@@ -1769,6 +1830,8 @@ def gui_main() -> None:
     ttk.Checkbutton(display_filters, text="Da verificare", variable=show_unverified,
                     command=lambda: refresh()).pack(side="left", padx=(0, 12))
     ttk.Checkbutton(display_filters, text="Storico e scaduti", variable=show_archived,
+                    command=lambda: refresh()).pack(side="left", padx=(0, 12))
+    ttk.Checkbutton(display_filters, text="Solo codici recenti", variable=recent_only,
                     command=lambda: refresh()).pack(side="left")
 
     bulk_controls = ttk.Frame(main)
@@ -1786,7 +1849,9 @@ def gui_main() -> None:
     table_frame.pack(fill="both", expand=True)
     table_frame.rowconfigure(0, weight=1)
     table_frame.columnconfigure(0, weight=1)
-    cols = ("game", "code", "status", "verify", "expires", "published", "seen", "last", "sources", "reward")
+    cols = DEFAULT_COLUMNS
+    saved_widths = restore_column_widths(cfg.get("table_widths"))
+    saved_columns = restore_column_order(cfg.get("table_columns"))
     tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="extended")
     headings = {
         "game": "Gioco", "code": "Codice", "status": "Stato",
@@ -1794,14 +1859,10 @@ def gui_main() -> None:
         "seen": "Prima rilevazione", "last": "Ultima vista", "sources": "Fonti",
         "reward": "Ricompensa",
     }
-    widths = {
-        "game": 125, "code": 168, "status": 165,
-        "verify": 165, "expires": 151, "published": 124, "seen": 155, "last": 155, "sources": 62,
-        "reward": 270,
-    }
     for c in cols:
         tree.heading(c, text=headings[c], command=lambda col=c: sort_by(col))
-        tree.column(c, width=widths[c], minwidth=65, anchor="w", stretch=True)
+        tree.column(c, width=saved_widths[c], minwidth=65, anchor="w", stretch=True)
+    tree.configure(displaycolumns=saved_columns)
     tree.grid(row=0, column=0, sticky="nsew")
     scrollbar_y = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
     scrollbar_y.grid(row=0, column=1, sticky="ns")
@@ -1915,11 +1976,42 @@ def gui_main() -> None:
             ))
         ttk.Button(window, text="Chiudi", command=window.destroy).pack(pady=5)
 
+    heading_drag = {"origin": None, "ignore_sort": False}
+
+    def visual_columns():
+        return restore_column_order(tree["displaycolumns"])
+
+    def header_press(event):
+        heading_drag["origin"] = (
+            tree.identify_column(event.x)
+            if tree.identify_region(event.x, event.y) == "heading" else None
+        )
+
+    def header_release(event):
+        start = heading_drag["origin"]
+        heading_drag["origin"] = None
+        if not start or tree.identify_region(event.x, event.y) != "heading":
+            return
+        target = tree.identify_column(event.x)
+        if start == target:
+            return
+        visual = visual_columns()
+        try:
+            src = visual[int(start[1:]) - 1]
+            dst = visual[int(target[1:]) - 1]
+        except (IndexError, ValueError):
+            return
+        tree.configure(displaycolumns=move_column(visual, src, dst))
+        heading_drag["ignore_sort"] = True
+        root.after_idle(lambda: heading_drag.update(ignore_sort=False))
+
     def sort_by(col):
+        if heading_drag["ignore_sort"]:
+            return
         if order["column"] == col:
             order["desc"] = not order["desc"]
         else:
-            order["column"], order["desc"] = col, False
+            order["column"], order["desc"] = col, col == "published"
         refresh()
 
     def refresh():
@@ -1951,6 +2043,10 @@ def gui_main() -> None:
             sql += " ORDER BY used ASC, CASE WHEN status='active' THEN 0 ELSE 1 END, score DESC, first_seen DESC"
         rows = con.execute(sql, params).fetchall()
         con.close()
+        if recent_only.get():
+            rows = [row for row in rows if is_recent_code(row)]
+        if order["column"] == "published":
+            rows = sort_rows_by_post_date(rows, descending=order["desc"])
         for r in rows:
             if r["status"] != "active":
                 tag = "archived"
@@ -1966,13 +2062,7 @@ def gui_main() -> None:
                 src_count = len(json.loads(r["sources_json"] or "[]"))
             except Exception:
                 src_count = r["source_count"]
-            post_dates = []
-            try:
-                post_dates = [src.get("published_at", "") for src in json.loads(r["sources_json"] or "[]")
-                              if isinstance(src, dict) and src.get("published_at")]
-            except (ValueError, TypeError):
-                pass
-            newest_post = max(post_dates, default="")
+            newest_post = latest_post_date(r)
             post_label = newest_post[:10] if newest_post else "Data non nota"
             seen = (r["first_seen"] or "").replace("T", " ")[:16]
             display_status = {"active": "Segnalato (non garantito)", "expired": "Scaduto", "stale": "Non più rilevato",
@@ -2057,7 +2147,12 @@ def gui_main() -> None:
             age = age_days(posted)
             date_label = (f"post {posted[:10]} / {age} giorni fa" if age is not None
                           else "pubblicazione non dichiarata")
-            lb.insert("end", f"[{src.get('kind','')}] {src.get('name','')} ({date_label}) — {src.get('url','')}")
+            checked = src.get("checked_at", "")
+            evidence = ("elencato in Attivi" if src.get("listed_active")
+                        else "citazione / segnalazione")
+            checked_label = f"; visto {checked[:10]}" if checked else ""
+            lb.insert("end", f"[{src.get('kind','')}] {src.get('name','')} "
+                             f"({date_label}; {evidence}{checked_label}) — {src.get('url','')}")
         def open_src():
             sel = lb.curselection()
             if not sel:
@@ -2250,10 +2345,29 @@ def gui_main() -> None:
         search_timer = root.after(240, refresh)
 
     search_var.trace_add("write", schedule_search)
-    tree.bind("<Double-1>", lambda e: copy_selected())
+    tree.bind("<Double-1>", lambda e: (
+        show_sources_selected() if tree.identify_region(e.x, e.y) == "cell" else None
+    ))
+    tree.bind("<ButtonPress-1>", header_press, add="+")
+    tree.bind("<ButtonRelease-1>", header_release, add="+")
     tree.bind("<<TreeviewSelect>>", update_selection_count)
     tree.bind("<Control-a>", select_all_shortcut)
     check_btn.config(command=do_check)
+
+    def close_and_save():
+        try:
+            stored = load_config()
+            stored["table_columns"] = list(visual_columns())
+            stored["table_widths"] = {
+                col: max(65, min(850, int(tree.column(col, "width")))) for col in cols
+            }
+            stored["recent_only"] = bool(recent_only.get())
+            save_config(stored)
+        except Exception as exc:
+            log(f"Impossibile salvare il layout della tabella: {exc}")
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", close_and_save)
     refresh()
     root.after(750, do_check)  # first launch refreshes current codes immediately
     root.mainloop()

@@ -1,10 +1,10 @@
-# GameCode Sentinel 1.6.0
+# GameCode Sentinel 1.7.0
 
 Windows tracker for **AION 2**, **Genshin Impact** and **Aniimo** redemption codes. Local SQLite database; notifications are optional. Code detection is probabilistic: a published string is not proof it can be redeemed. Version 1.3.2 rejects common AION 2 reward names accidentally tagged as codes and quarantines previously stored suspicious Reddit entries.
 
 ## Windows (without Python)
 
-After a successful GitHub Actions run, download the `GameCodeSentinel-Windows-v1.6.0` artifact from the **Build Windows EXE** workflow, unzip, and run `GameCodeSentinel.exe`. Windows SmartScreen may warn for an unsigned executable. Only install software you trust.
+After a successful GitHub Actions run, download the `GameCodeSentinel-Windows-v1.7.0` artifact from the **Build Windows EXE** workflow, unzip, and run `GameCodeSentinel.exe`. Windows SmartScreen may warn for an unsigned executable. Only install software you trust.
 
 ## From source
 
@@ -20,7 +20,7 @@ Exit status 2 means zero sources were reachable. `python app.py --version` only 
 ## CI
 
 - **Cross-platform Tests**: automated regression tests on Windows and Ubuntu with Python 3.11 and 3.13. This workflow also performs a live AION 2 HTTP scan on main-branch changes, manual invocation, and daily at 06:37 UTC. Scan reports are public; web sources may rate-limit requests.
-- **Build Windows EXE**: native Windows compilation with PyInstaller, executable exit-code smoke test, and SHA-256 checksum. Download the `GameCodeSentinel-Windows-v1.4.0` artifact from a green run; the EXE is not signed.
+- **Build Windows EXE**: native Windows compilation with PyInstaller, executable exit-code smoke test, and SHA-256 checksum. Download the `GameCodeSentinel-Windows-v1.7.0` artifact from a green run; the EXE is not signed.
 - **Dependabot**: weekly update proposals for Python dependencies and GitHub Actions; review any proposed changes before merging.
 - The GitHub live scan is **stateless**. Your personal code history remains local on your Windows PC. A code mentioned online is not necessarily a redeemable coupon.
 
@@ -29,6 +29,27 @@ Do not commit `config.json`, `codes.db`, `.env`, notification topics, logs or cr
 ## Notes
 
 The license has not been selected. Public visibility is not a license granting reuse. Credits and previous technical audit are in `AUDIT_V1.1.txt` and `AUDIT_V1.2.txt`.
+
+## Novità 1.7.0 — liste attive e tabella personalizzabile
+
+### Controllo più intelligente della freschezza (richiesta #1)
+
+- Un codice può avere una **vecchia data di pubblicazione** ma comparire ancora sotto una sezione esplicita **Active/Working/Current/Valid codes** di un **tracker editoriale** visitato oggi. Questo viene salvato come riscontro **"Presente in elenco attivi (non garantito)"**, distinto dalla mera citazione storica. Gli elenchi "Expired/Old/Not working codes" non valgono come conferma.
+- Una notizia ufficiale vecchia, un articolo di archivio, la semplice modifica recente della pagina o il fatto che un sito risponda **HTTP 200** **non** rendono di per sé il codice attivo.
+- I codici di pagine editoriali senza metadati di pubblicazione e **senza esplicito elenco attivi** restano **Da riverificare**; quando disponibile, nel dettaglio delle fonti appare anche la data dell'ultimo controllo. Reddit continua a usare le date originali del singolo post/commento.
+- Una voce precedentemente da riverificare può tornare segnalata attiva se appare in un esplicito elenco corrente, ma il punteggio di una sola fonte resta modesto. Due fonti editoriali indipendenti possono offrire maggior corroborazione.
+- Rimangono prioritari gli stati **Scaduto/Non valido** già conosciuti; nessuna fonte web prova che il codice sia riscattabile per uno specifico account.
+
+### Tabella evoluta (richiesta #6)
+
+- **Data post** ora è davvero ordinabile cliccando sull'intestazione: prima i più recenti, al secondo clic i meno recenti; pubblicazione sconosciuta sempre in fondo. Non si usa la data dell'ultima scansione come data del post.
+- Checkbox **Solo codici recenti**: mostra solo le voci con almeno una pubblicazione datata entro 30 giorni per Genshin Impact, 90 per AION 2 e Aniimo. Le date ignote vengono escluse **solo quando il filtro è attivo**. Puoi combinarlo con le altre opzioni di visualizzazione.
+- Puoi **trascinare le intestazioni** per riordinare le colonne e **trascinare i separatori** per ridimensionarle. Ordine e larghezze vengono salvati in `config.json` **quando chiudi normalmente la finestra** e ripristinati al lancio, con validazione dei valori salvati. Non cambia l'ordine dei campi nel database.
+- **Doppio clic su un codice** apre la finestra delle **fonti**; lì puoi aprire il link della fonte con un altro doppio clic. Il pulsante "Copia codice" resta disponibile.
+
+### Installazione
+
+Apri [Releases](https://github.com/sadokgpt/GameCodeSentinel/releases), scegli `v1.7.0` e scarica `GameCodeSentinel.exe` e, per controllarne l'integrità, `SHA256SUMS.txt`. L'EXE non è firmato digitalmente. La release viene pubblicata dal workflow Windows su `main` **solo dopo** test, compilazione e smoke test superati.
 
 ## Novità 1.6.0 — filtro anti-post vecchi, con date verificabili
 

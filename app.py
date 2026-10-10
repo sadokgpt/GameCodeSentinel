@@ -32,7 +32,7 @@ except Exception:
     search_dates = None
 
 APP_NAME = "GameCodeSentinel"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (+local Windows code tracker; contact: local-user)"
 REQUEST_TIMEOUT = 18
 MAX_CRAWL_LINKS = 14
@@ -1484,9 +1484,13 @@ def update_code_state(con: sqlite3.Connection, row_ids: list[int], action: str) 
 
 
 def redeem_url_for(game: str, code: str) -> Optional[str]:
-    if game == GAME_GENSHIN:
-        return "https://genshin.hoyoverse.com/en/gift?code=" + quote_plus(code)
-    return None
+    """Solo pagina ufficiale: nessun login, token o invio automatico."""
+    if game != GAME_GENSHIN or not isinstance(code, str):
+        return None
+    token = code.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{4,64}", token):
+        return None
+    return "https://genshin.hoyoverse.com/en/gift?code=" + quote_plus(token)
 
 
 def current_launch_command() -> str:
@@ -1561,86 +1565,163 @@ def gui_main() -> None:
     con = connect_db()
     con.close()
 
-    root = tk.Tk()
-    root.title(f"{APP_NAME} {APP_VERSION}")
-    root.geometry("1160x680")
-    root.minsize(920, 560)
+    from sentinel_ui import PALETTE, apply_theme, metric_card
 
-    status_var = tk.StringVar(value="Pronto. I codici usati sono nascosti per impostazione predefinita.")
+    root = tk.Tk()
+    root.title(f"{APP_NAME}  |  v{APP_VERSION}")
+    root.geometry("1320x780")
+    root.minsize(1070, 640)
+    apply_theme(root)
+
+    status_var = tk.StringVar(value="Pronto. Le fonti vengono controllate all'avvio.")
+    selection_var = tk.StringVar(value="Selezionati: 0")
     show_used = tk.BooleanVar(value=False)
     show_unverified = tk.BooleanVar(value=bool(cfg.get("show_unverified", False)))
     show_archived = tk.BooleanVar(value=False)
     game_filter = tk.StringVar(value="Tutti")
     search_var = tk.StringVar(value="")
     order = {"column": "", "desc": False}
+    stats = {
+        "visible": tk.StringVar(value="—"),
+        "active": tk.StringVar(value="—"),
+        "trusted": tk.StringVar(value="—"),
+    }
 
-    top = ttk.Frame(root, padding=10)
-    top.pack(fill="x")
-    ttk.Label(top, text="GameCode Sentinel", font=("Segoe UI", 18, "bold")).pack(side="left")
-    ttk.Label(top, text="  Codici reali, deduplicati, con livello di verifica", font=("Segoe UI", 10)).pack(side="left", pady=(6, 0))
+    # Sidebar stabile: azioni di configurazione, diagnostica e assistenza.
+    sidebar = ttk.Frame(root, style="Sidebar.TFrame", width=215, padding=(19, 23))
+    sidebar.pack(side="left", fill="y")
+    sidebar.pack_propagate(False)
+    ttk.Label(sidebar, text="◆  GAMECODE", style="Brand.TLabel").pack(anchor="w")
+    ttk.Label(sidebar, text="SENTINEL   /   DESKTOP", style="SidebarNote.TLabel").pack(
+        anchor="w", pady=(4, 30))
+    ttk.Label(sidebar, text="WORKSPACE", style="SidebarHeading.TLabel").pack(
+        anchor="w", pady=(0, 9))
+    ttk.Button(sidebar, text="◈  Panoramica", style="Nav.TButton",
+               command=lambda: refresh()).pack(fill="x", pady=2)
+    ttk.Button(sidebar, text="↻  Controlla codici", style="Nav.TButton",
+               command=lambda: do_check()).pack(fill="x", pady=2)
+    ttk.Button(sidebar, text="◎  Stato fonti", style="Nav.TButton",
+               command=lambda: show_source_health()).pack(fill="x", pady=2)
+    ttk.Button(sidebar, text="▣  Backup locali", style="Nav.TButton",
+               command=lambda: show_backups()).pack(fill="x", pady=2)
+    ttk.Button(sidebar, text="⚙  Impostazioni", style="Nav.TButton",
+               command=lambda: open_settings()).pack(fill="x", pady=2)
+    ttk.Separator(sidebar).pack(fill="x", pady=(28, 17))
+    ttk.Label(sidebar, text="RISCATTO GENSHIN", style="SidebarHeading.TLabel").pack(
+        anchor="w")
+    ttk.Label(sidebar, text="Apertura sito ufficiale con\ncodice precompilato. Login\ne conferma restano manuali.",
+              style="SidebarNote.TLabel", justify="left").pack(anchor="w", pady=(8, 0))
+    ttk.Frame(sidebar, style="Sidebar.TFrame").pack(fill="both", expand=True)
+    ttk.Label(sidebar, text=f"VERSIONE  {APP_VERSION}", style="SidebarNote.TLabel").pack(
+        anchor="w", pady=(8, 0))
+    ttk.Label(sidebar, text="Dati conservati sul PC", style="SidebarNote.TLabel").pack(
+        anchor="w", pady=(3, 0))
 
-    controls = ttk.Frame(root, padding=(10, 0, 10, 8))
-    controls.pack(fill="x")
+    main = ttk.Frame(root, padding=(23, 20, 23, 15))
+    main.pack(side="left", fill="both", expand=True)
 
-    check_btn = ttk.Button(controls, text="Controlla ora")
-    check_btn.pack(side="left", padx=(0, 6))
-    ttk.Button(controls, text="Copia codice", command=lambda: copy_selected()).pack(side="left", padx=3)
-    ttk.Button(controls, text="Riscatta / istruzioni", command=lambda: redeem_selected()).pack(side="left", padx=3)
-    ttk.Button(controls, text="Segna usati", command=lambda: mark_selected("used")).pack(side="left", padx=3)
-    ttk.Button(controls, text="Segna non valido", command=lambda: mark_selected("invalid")).pack(side="left", padx=3)
-    ttk.Button(controls, text="Fonti", command=lambda: show_sources_selected()).pack(side="left", padx=3)
-    ttk.Button(controls, text="Impostazioni", command=lambda: open_settings()).pack(side="right")
-    ttk.Button(controls, text="Stato fonti", command=lambda: show_source_health()).pack(side="right", padx=5)
-    ttk.Button(controls, text="Backup", command=lambda: show_backups()).pack(side="right", padx=5)
+    header = ttk.Frame(main)
+    header.pack(fill="x", pady=(0, 15))
+    header_text = ttk.Frame(header)
+    header_text.pack(side="left", fill="x", expand=True)
+    ttk.Label(header_text, text="Centro codici", style="Title.TLabel").pack(anchor="w")
+    ttk.Label(header_text, text="Monitora le fonti, valuta l'affidabilità e gestisci i riscatti.",
+              style="Subtitle.TLabel").pack(anchor="w", pady=(3, 0))
+    check_btn = ttk.Button(header, text="↻  Controlla ora", style="Primary.TButton")
+    check_btn.pack(side="right", padx=(12, 0), pady=(4, 0))
 
-    filters = ttk.Frame(root, padding=(10, 0, 10, 8))
-    filters.pack(fill="x")
-    ttk.Label(filters, text="Gioco:").pack(side="left")
-    combo = ttk.Combobox(filters, state="readonly", width=20, textvariable=game_filter, values=["Tutti"] + GAMES)
-    combo.pack(side="left", padx=(5, 14))
-    ttk.Label(filters, text="Cerca:").pack(side="left")
-    ttk.Entry(filters, textvariable=search_var, width=19).pack(side="left", padx=(5, 12))
-    ttk.Checkbutton(filters, text="Mostra usati", variable=show_used, command=lambda: refresh()).pack(side="left", padx=5)
-    ttk.Checkbutton(filters, text="Mostra da verificare", variable=show_unverified, command=lambda: refresh()).pack(side="left", padx=5)
-    ttk.Checkbutton(filters, text="Mostra storico/scaduti", variable=show_archived, command=lambda: refresh()).pack(side="left", padx=5)
+    metrics = ttk.Frame(main)
+    metrics.pack(fill="x", pady=(0, 17))
+    for index, (title, key) in enumerate((
+        ("CODICI VISIBILI", "visible"),
+        ("SEGNALATI ATTIVI", "active"),
+        ("AFFIDABILITÀ ≥ 85", "trusted"),
+    )):
+        card = metric_card(metrics, title, stats[key])
+        card.pack(side="left", fill="x", expand=True,
+                  padx=(0, 10) if index < 2 else (0, 0))
 
-    bulk_controls = ttk.Frame(root, padding=(10, 0, 10, 8))
-    bulk_controls.pack(fill="x")
-    ttk.Label(bulk_controls, text="Selezione: Ctrl+clic, Maiusc+clic oppure Ctrl+A").pack(side="left")
-    ttk.Button(bulk_controls, text="Seleziona tutti visibili",
-               command=lambda: select_all_visible()).pack(side="left", padx=(12, 4))
+    filters = ttk.Frame(main)
+    filters.pack(fill="x", pady=(0, 5))
+    ttk.Label(filters, text="Gioco").pack(side="left")
+    combo = ttk.Combobox(filters, state="readonly", width=18, textvariable=game_filter,
+                         values=["Tutti"] + GAMES)
+    combo.pack(side="left", padx=(9, 18))
+    ttk.Label(filters, text="Cerca codice o ricompensa").pack(side="left")
+    ttk.Entry(filters, textvariable=search_var, width=27).pack(
+        side="left", padx=(9, 6), fill="x", expand=True)
+
+    display_filters = ttk.Frame(main)
+    display_filters.pack(fill="x", pady=(1, 13))
+    ttk.Checkbutton(display_filters, text="Includi usati", variable=show_used,
+                    command=lambda: refresh()).pack(side="left", padx=(0, 12))
+    ttk.Checkbutton(display_filters, text="Da verificare", variable=show_unverified,
+                    command=lambda: refresh()).pack(side="left", padx=(0, 12))
+    ttk.Checkbutton(display_filters, text="Storico e scaduti", variable=show_archived,
+                    command=lambda: refresh()).pack(side="left")
+
+    bulk_controls = ttk.Frame(main)
+    bulk_controls.pack(fill="x", pady=(0, 8))
+    ttk.Label(bulk_controls, textvariable=selection_var,
+              style="Subtitle.TLabel").pack(side="left", padx=(0, 10))
+    ttk.Button(bulk_controls, text="Seleziona tutti",
+               command=lambda: select_all_visible()).pack(side="left", padx=(0, 5))
     ttk.Button(bulk_controls, text="Deseleziona",
-               command=lambda: clear_selection()).pack(side="left", padx=4)
+               command=lambda: clear_selection()).pack(side="left", padx=(0, 5))
     ttk.Button(bulk_controls, text="Ripristina usati",
                command=lambda: mark_selected("restore")).pack(side="right")
 
+    table_frame = ttk.Frame(main, style="Surface.TFrame")
+    table_frame.pack(fill="both", expand=True)
+    table_frame.rowconfigure(0, weight=1)
+    table_frame.columnconfigure(0, weight=1)
     cols = ("game", "code", "status", "reward", "verify", "expires", "seen", "last", "sources")
-    tree = ttk.Treeview(root, columns=cols, show="headings", selectmode="extended")
+    tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="extended")
     headings = {
-        "game": "Gioco", "code": "Codice", "status": "Stato", "reward": "Ricompensa", "verify": "Verifica",
-        "expires": "Scadenza (IT AION)", "seen": "Prima rilevazione", "last": "Ultima vista", "sources": "Fonti",
+        "game": "Gioco", "code": "Codice", "status": "Stato", "reward": "Ricompensa",
+        "verify": "Verifica", "expires": "Scadenza (IT AION)",
+        "seen": "Prima rilevazione", "last": "Ultima vista", "sources": "Fonti",
     }
-    widths = {"game": 110, "code": 170, "status": 130, "reward": 310, "verify": 185, "expires": 145, "seen": 135, "last": 135, "sources": 60}
+    widths = {
+        "game": 125, "code": 168, "status": 165, "reward": 270,
+        "verify": 165, "expires": 151, "seen": 155, "last": 155, "sources": 62,
+    }
     for c in cols:
         tree.heading(c, text=headings[c], command=lambda col=c: sort_by(col))
-        tree.column(c, width=widths[c], anchor="w")
-    tree.pack(fill="both", expand=True, padx=10)
-    tree.tag_configure("official", background="#e8f5e9")
-    tree.tag_configure("confirmed", background="#eef6ff")
-    tree.tag_configure("unverified", background="#fff8e1")
-    tree.tag_configure("used", foreground="#777777")
-    tree.tag_configure("archived", foreground="#888888")
+        tree.column(c, width=widths[c], minwidth=65, anchor="w", stretch=True)
+    tree.grid(row=0, column=0, sticky="nsew")
+    scrollbar_y = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+    scrollbar_y.grid(row=0, column=1, sticky="ns")
+    scrollbar_x = ttk.Scrollbar(table_frame, orient="horizontal", command=tree.xview)
+    scrollbar_x.grid(row=1, column=0, sticky="ew")
+    tree.configure(yscrollcommand=scrollbar_y.set, xscrollcommand=scrollbar_x.set)
+    tree.tag_configure("official", background="#173a32", foreground="#b7f7d6")
+    tree.tag_configure("confirmed", background="#1a3049", foreground="#c3e1ff")
+    tree.tag_configure("unverified", background="#44371f", foreground="#ffe7a3")
+    tree.tag_configure("used", background=PALETTE["surface"], foreground="#8d9cb3")
+    tree.tag_configure("archived", background=PALETTE["surface"], foreground="#8d9cb3")
 
-    sb = ttk.Scrollbar(tree, orient="vertical", command=tree.yview)
-    tree.configure(yscrollcommand=sb.set)
-    sb.pack(side="right", fill="y")
+    actions = ttk.Frame(main)
+    actions.pack(fill="x", pady=(11, 0))
+    ttk.Button(actions, text="Copia codice",
+               command=lambda: copy_selected()).pack(side="left", padx=(0, 6))
+    ttk.Button(actions, text="Apri riscatto",
+               style="Primary.TButton", command=lambda: redeem_selected()).pack(
+                   side="left", padx=(0, 6))
+    ttk.Button(actions, text="Segna usati",
+               command=lambda: mark_selected("used")).pack(side="left", padx=(0, 6))
+    ttk.Button(actions, text="Segna non valido",
+               style="Danger.TButton", command=lambda: mark_selected("invalid")).pack(
+                   side="left", padx=(0, 6))
+    ttk.Button(actions, text="Fonti del codice",
+               command=lambda: show_sources_selected()).pack(side="right")
 
-    bottom = ttk.Frame(root, padding=10)
-    bottom.pack(fill="x")
-    ttk.Label(bottom, textvariable=status_var).pack(side="left")
-    selection_var = tk.StringVar(value="Selezionati: 0")
-    ttk.Label(bottom, textvariable=selection_var).pack(side="left", padx=(12, 0))
-    ttk.Label(bottom, text="Verde=ufficiale · Azzurro=confermato · Giallo=da verificare", foreground="#555").pack(side="right")
+    footer = ttk.Frame(main)
+    footer.pack(fill="x", pady=(13, 0))
+    ttk.Label(footer, textvariable=status_var, style="Subtitle.TLabel",
+              wraplength=760).pack(side="left")
+    ttk.Label(footer, text="● Ufficiale   ● Confermato   ● Da verificare",
+              style="Subtitle.TLabel").pack(side="right")
 
     def selected_ids() -> list[int]:
         return [int(item) for item in tree.selection()]
@@ -1778,7 +1859,10 @@ def gui_main() -> None:
             tree.insert("", "end", iid=str(r["id"]), values=(
                 r["game"], r["code"], display_status, r["rewards"] or "—", r["confidence"], r["expires_at"] or "—", seen, (r["last_seen"] or "").replace("T", " ")[:16], r["source_count"],
             ), tags=(tag,))
-        status_var.set(f"{len(rows)} codici visibili. Database: {DB_PATH}")
+        stats["visible"].set(str(len(rows)))
+        stats["active"].set(str(sum(r["status"] == "active" and not r["used"] for r in rows)))
+        stats["trusted"].set(str(sum(r["status"] == "active" and not r["used"] and r["score"] >= 85 for r in rows)))
+        status_var.set(f"{len(rows)} codici visibili  ·  archivio locale: {DB_PATH}")
         update_selection_count()
 
     def copy_selected():
@@ -1858,21 +1942,64 @@ def gui_main() -> None:
     def redeem_selected():
         rid = selected_id()
         if rid is None:
-            messagebox.showinfo(APP_NAME, "Seleziona un solo codice.")
+            messagebox.showinfo(APP_NAME, "Seleziona un solo codice.", parent=root)
             return
         r = get_row(rid)
-        if r["status"] != "active":
-            messagebox.showwarning(APP_NAME, "Questo codice non è segnalato come attivo. Controlla le fonti prima di usarlo.")
+        if r is None:
+            refresh()
             return
-        root.clipboard_clear(); root.clipboard_append(r["code"])
+        if r["status"] != "active":
+            messagebox.showwarning(APP_NAME,
+                "Il codice non è segnalato come attivo. Verifica prima le fonti.",
+                parent=root)
+            return
+        if r["used"] and not messagebox.askyesno(
+            APP_NAME, "Questo codice risulta già segnato come usato. Vuoi aprirlo comunque?",
+            parent=root,
+        ):
+            return
+        root.clipboard_clear()
+        root.clipboard_append(r["code"])
         url = redeem_url_for(r["game"], r["code"])
-        if url:
-            webbrowser.open(url)
-            messagebox.showinfo(APP_NAME, f"Ho aperto la pagina ufficiale e copiato {r['code']} negli appunti.\n\nDopo il riscatto premi 'Segna come usato'.")
+        if r["game"] == GAME_GENSHIN:
+            if not url:
+                messagebox.showwarning(APP_NAME,
+                    "Formato codice non valido per il collegamento Genshin. "
+                    "Il testo resta negli appunti.", parent=root)
+                return
+            try:
+                opened = webbrowser.open(url, new=2)
+            except Exception as exc:
+                log(f"Impossibile aprire pagina Genshin: {exc}")
+                opened = False
+            if not opened:
+                messagebox.showwarning(APP_NAME,
+                    "Il browser non ha confermato l'apertura. "
+                    "Puoi incollare il codice copiato nel sito ufficiale:\\n"
+                    "https://genshin.hoyoverse.com/en/gift",
+                    parent=root)
+                return
+            messagebox.showinfo(
+                APP_NAME,
+                f"Pagina HoYoverse aperta con il codice {r['code']} nell'URL.\\n\\n"
+                "Accedi direttamente sul sito, controlla server e personaggio "
+                "e conferma manualmente il riscatto. Se il campo non viene "
+                "precompilato, incolla il codice dagli appunti.\\n\\n"
+                "Segna il codice come usato SOLO dopo l'esito positivo. "
+                "GameCode Sentinel non accede al tuo account.",
+                parent=root,
+            )
+            status_var.set(f"Riscatto assistito aperto: {r['code']}")
         elif r["game"] == GAME_ANIIMO:
-            messagebox.showinfo(APP_NAME, f"Codice copiato: {r['code']}\n\nAniimo: Settings → Account → Gift Code Redemption.\nDopo il riscatto premi 'Segna come usato'.")
+            messagebox.showinfo(APP_NAME,
+                f"Codice copiato: {r['code']}\\n\\n"
+                "Aniimo: Settings → Account → Gift Code Redemption.\\n"
+                "Segna come usato solo dopo il riscatto.", parent=root)
         elif r["game"] == GAME_AION2:
-            messagebox.showinfo(APP_NAME, f"Codice copiato: {r['code']}\n\nAION 2: Settings → Miscellaneous/Other → Account → Coupon Registration.\nDopo il riscatto premi 'Segna come usato'.")
+            messagebox.showinfo(APP_NAME,
+                f"Codice copiato: {r['code']}\\n\\n"
+                "AION 2: Settings → Miscellaneous/Other → Account → Coupon Registration.\\n"
+                "Segna come usato solo dopo il riscatto.", parent=root)
 
     def do_check():
         check_btn.config(state="disabled")
@@ -1895,7 +2022,7 @@ def gui_main() -> None:
                 root.after(0, lambda: [refresh(), status_var.set(msg), check_btn.config(state="normal")])
             except Exception as exc:
                 log(f"Check GUI error: {exc}")
-                root.after(0, lambda: [status_var.set(f"Errore: {exc}"), check_btn.config(state="normal")])
+                root.after(0, lambda error=str(exc): [status_var.set(f"Errore: {error}"), check_btn.config(state="normal")])
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1980,7 +2107,16 @@ def gui_main() -> None:
         frm.columnconfigure(1, weight=1)
 
     combo.bind("<<ComboboxSelected>>", lambda e: refresh())
-    search_var.trace_add("write", lambda *_: refresh())
+    search_timer = None
+
+    def schedule_search(*_args):
+        # Debounce: digitare rapidamente non rilegge l'intero database a ogni tasto.
+        nonlocal search_timer
+        if search_timer is not None:
+            root.after_cancel(search_timer)
+        search_timer = root.after(240, refresh)
+
+    search_var.trace_add("write", schedule_search)
     tree.bind("<Double-1>", lambda e: copy_selected())
     tree.bind("<<TreeviewSelect>>", update_selection_count)
     tree.bind("<Control-a>", select_all_shortcut)

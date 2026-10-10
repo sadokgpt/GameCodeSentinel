@@ -14,7 +14,8 @@ import time
 import webbrowser
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
+from sentinel_freshness import extract_page_dates, parse_publication_time, is_old_post, age_days
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Iterable, Optional
@@ -32,7 +33,7 @@ except Exception:
     search_dates = None
 
 APP_NAME = "GameCodeSentinel"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.6.0"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (+local Windows code tracker; contact: local-user)"
 REQUEST_TIMEOUT = 18
 MAX_CRAWL_LINKS = 14
@@ -120,6 +121,8 @@ class Candidate:
     context: str = ""
     reddit_confirmations: int = 0
     reddit_negatives: int = 0
+    published_at: str = ""
+    updated_at: str = ""
 
     @property
     def normalized(self) -> str:
@@ -284,6 +287,41 @@ def connect_db() -> sqlite3.Connection:
                 "WHERE id=?", (row["id"],)
             )
         con.execute("INSERT INTO meta(key, value) VALUES('aion_code_shape_review_v131','1')")
+
+    # Version 1.5 and older did not store post publication timestamps.
+    # Existing active entries with no dated evidence must be re-reviewed,
+    # otherwise a repost from 2022 can remain 'confirmed' forever.
+    reviewed = con.execute(
+        "SELECT value FROM meta WHERE key='post_provenance_review_v160'"
+    ).fetchone()
+    if reviewed is None:
+        legacy = []
+        # Very old v1 databases may not yet have modern columns. Do not break
+        # their startup or interfere with the existing v1 notification migration.
+        if {"id", "status", "used", "sources_json"} <= existing_cols:
+            legacy_rows = con.execute(
+                "SELECT id, sources_json FROM codes WHERE status='active' AND used=0"
+            ).fetchall()
+        else:
+            legacy_rows = []
+        for row in legacy_rows:
+            try:
+                sources = json.loads(row["sources_json"] or "[]")
+            except (ValueError, TypeError):
+                sources = []
+            if not any(isinstance(src, dict) and src.get("published_at") for src in sources):
+                legacy.append((row["id"],))
+        if legacy:
+            con.commit()
+            # Consistent backup BEFORE quarantine; historical rows are preserved.
+            backup_sqlite(DB_PATH, force=True)
+            con.executemany(
+                "UPDATE codes SET status='review', score=0, "
+                "confidence='STORICO PRECEDENTE / DATA POST DA RIVERIFICARE' WHERE id=?",
+                legacy,
+            )
+            log(f"Riverifica date: {len(legacy)} vecchi codici senza origine temporale")
+        con.execute("INSERT INTO meta(key, value) VALUES('post_provenance_review_v160','1')")
     con.commit()
     return con
 
@@ -785,9 +823,18 @@ def discover_crawl_links(base_url: str, raw_html: str, link_hint: str = "") -> l
     return links
 
 
+def enrich_with_page_dates(candidates: list[Candidate], html: str) -> list[Candidate]:
+    """Attribute the actual fetched page date, never the scanner's download time."""
+    published, updated = extract_page_dates(html)
+    for cand in candidates:
+        cand.published_at = published
+        cand.updated_at = updated
+    return candidates
+
+
 def fetch_page_source(session: requests.Session, source: Source) -> tuple[list[Candidate], int]:
     resp = http_get(session, source.url)
-    found = extract_candidates_html(source.game, resp.text, source, resp.url)
+    found = enrich_with_page_dates(extract_candidates_html(source.game, resp.text, source, resp.url), resp.text)
     # A soft-404 / cookie wall returning HTTP 200 is NOT reliable evidence
     # that codes previously listed by a tracker have gone away.
     if source.kind == "secondary" and not found and not plausible_tracker_page(resp.text, source.game):
@@ -800,12 +847,12 @@ def fetch_crawl_source(session: requests.Session, source: Source) -> tuple[list[
     first_html = resp.text
     links = discover_crawl_links(resp.url, first_html, source.link_hint)
 
-    all_candidates = extract_candidates_html(source.game, first_html, source, resp.url)
+    all_candidates = enrich_with_page_dates(extract_candidates_html(source.game, first_html, source, resp.url), first_html)
     fetched = 1
     for href in links:
         try:
             r = http_get(session, href)
-            all_candidates.extend(extract_candidates_html(source.game, r.text, source, r.url))
+            all_candidates.extend(enrich_with_page_dates(extract_candidates_html(source.game, r.text, source, r.url), r.text))
             fetched += 1
             time.sleep(0.12)
         except Exception as exc:
@@ -827,15 +874,33 @@ def flatten_reddit_comments(node, texts: list[str]) -> None:
             flatten_reddit_comments(item, texts)
 
 
-def reddit_comment_texts(session: requests.Session, permalink: str) -> list[str]:
+def reddit_comment_entries(session: requests.Session, permalink: str) -> list[tuple[str, str]]:
+    """Include each comment's timestamp, not the age of the parent thread."""
     if not permalink:
         return []
     url = "https://www.reddit.com" + permalink.rstrip("/") + ".json?limit=35&depth=2&raw_json=1"
-    r = http_get(session, url)
-    payload = r.json()
-    texts: list[str] = []
-    flatten_reddit_comments(payload, texts)
-    return texts[:120]
+    payload = http_get(session, url).json()
+    entries: list[tuple[str, str]] = []
+
+    def visit(node):
+        if isinstance(node, dict):
+            data = node.get("data")
+            if node.get("kind") == "t1" and isinstance(data, dict):
+                body = data.get("body")
+                if isinstance(body, str) and body:
+                    entries.append((body, parse_publication_time(data.get("created_utc"))))
+            for val in node.values():
+                visit(val)
+        elif isinstance(node, list):
+            for val in node:
+                visit(val)
+
+    visit(payload)
+    return entries[:120]
+
+
+def reddit_comment_texts(session: requests.Session, permalink: str) -> list[str]:
+    return [body for body, _ in reddit_comment_entries(session, permalink)]
 
 
 def reddit_confirmation_counts_from_texts(texts: list[str], code: str = "", unique_code_in_post: bool = True) -> tuple[int, int]:
@@ -884,6 +949,11 @@ def fetch_reddit_source(session: requests.Session, source: Source, cfg: dict) ->
             post_url = "https://www.reddit.com" + permalink if permalink else data.get("url", url)
             post_html = f"<h1>{html_lib.escape(title)}</h1><p>{html_lib.escape(body)}</p>"
             found = extract_candidates_html(source.game, post_html, source, post_url)
+            posted = parse_publication_time(data.get("created_utc"))
+            for cand in found:
+                cand.published_at = posted
+                if not posted and cand.status == "active":
+                    cand.status = "review"
 
             # Search a small number of relevant recent comment threads too. This catches
             # codes posted only in megathread comments while keeping the daily request load low.
@@ -891,12 +961,16 @@ def fetch_reddit_source(session: requests.Session, source: Source, cfg: dict) ->
             comment_texts: list[str] = []
             if permalink and idx < 5:
                 try:
-                    comment_texts = reddit_comment_texts(session, permalink)
-                    if comment_texts:
-                        comment_html = "<div>" + "".join(
-                            f"<p>{html_lib.escape(t)}</p>" for t in comment_texts
-                        ) + "</div>"
-                        comment_found = extract_candidates_html(source.game, comment_html, source, post_url)
+                    dated_comments = reddit_comment_entries(session, permalink)
+                    comment_texts = [body for body, _ in dated_comments]
+                    for body_text, comment_date in dated_comments:
+                        comment_html = f"<div><p>{html_lib.escape(body_text)}</p></div>"
+                        extracted = extract_candidates_html(source.game, comment_html, source, post_url)
+                        for cand in extracted:
+                            cand.published_at = comment_date
+                            if not comment_date and cand.status == "active":
+                                cand.status = "review"
+                        comment_found.extend(extracted)
                 except Exception as exc:
                     log(f"Reddit comment scan fallito {post_url}: {exc}")
 
@@ -930,7 +1004,15 @@ def fetch_reddit_source(session: requests.Session, source: Source, cfg: dict) ->
             body = "" if content_node is None else "".join(content_node.itertext()).strip()
             post_url = rss_url if link_node is None else link_node.attrib.get("href", rss_url)
             post_html = f"<h1>{title}</h1><div>{body}</div>"
-            candidates.extend(extract_candidates_html(source.game, post_html, source, post_url))
+            from_atom = extract_candidates_html(source.game, post_html, source, post_url)
+            atom_pub = entry.find("{*}published")
+            atom_mod = entry.find("{*}updated")
+            for cand in from_atom:
+                cand.published_at = parse_publication_time(atom_pub.text if atom_pub is not None else "")
+                cand.updated_at = parse_publication_time(atom_mod.text if atom_mod is not None else "")
+                if not cand.published_at and cand.status == "active":
+                    cand.status = "review"
+            candidates.extend(from_atom)
         return candidates, 1
 
     return candidates, 1
@@ -966,7 +1048,10 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
 
         src_key = (c.source_name, c.source_url)
         if not any((src["name"], src["url"]) == src_key for src in item["sources"]):
-            item["sources"].append({"name": c.source_name, "url": c.source_url, "kind": c.source_kind})
+            item["sources"].append({
+                "name": c.source_name, "url": c.source_url, "kind": c.source_kind,
+                "published_at": c.published_at, "updated_at": c.updated_at,
+            })
 
         rank = rank_map.get(c.source_kind, 0)
         # Important for case-sensitive games such as Aniimo: preserve spelling from
@@ -982,8 +1067,13 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
         # Multiple posts/pages from the same source do not get multiple votes.
         # If the same source contains both an active and historical expired occurrence,
         # prefer the current active occurrence.
-        if state is None or (state[1] != "active" and c.status == "active"):
-            item["source_states"][c.source_name] = (c.source_kind, c.status)
+        # A dated old mention must not be interpreted as a fresh confirmation.
+        # It remains visible in the history; its status becomes "review", not expired.
+        evidence_status = ("review" if c.status == "active" and
+                           is_old_post(c.game, c.published_at) else c.status)
+        priority = {"active": 3, "expired": 2, "review": 1}
+        if state is None or priority[evidence_status] > priority[state[1]]:
+            item["source_states"][c.source_name] = (c.source_kind, evidence_status)
 
         if c.expires_at:
             # Prefer an official expiry over tracker/community dates. When
@@ -1001,8 +1091,14 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
         item["negatives"] = max(item["negatives"], c.reddit_negatives)
 
     for item in merged.values():
+        # Only current undated/fresh evidence contributes to the confidence score.
+        # An old post is NOT a vote even when it comes from an official channel.
+        trusted_sources = {
+            name: kind for name, (kind, status) in item["source_states"].items()
+            if status == "active"
+        }
         unique_sources = {name: kind_status[0] for name, kind_status in item["source_states"].items()}
-        kinds = list(unique_sources.values())
+        kinds = list(trusted_sources.values())
         official = "official" in kinds
         source_count = len(unique_sources)
         positives = item["confirmations"]
@@ -1016,10 +1112,12 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
                 return "publisher:gamurs"
             return "source:" + name.casefold()
 
-        secondary_count = len({editorial_group(name) for name, kind in unique_sources.items() if kind == "secondary"})
+        secondary_count = len({editorial_group(name) for name, kind in trusted_sources.items() if kind == "secondary"})
         community_count = sum(1 for kind in kinds if kind == "community")
 
-        if official:
+        if not trusted_sources:
+            score, conf = 0, "DATA POST OBSOLETA / DA RIVERIFICARE"
+        elif official:
             score, conf = 100, "UFFICIALE"
         elif secondary_count >= 2:
             score, conf = 90, "CONFERMATO (2+ fonti note)"
@@ -1043,9 +1141,14 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
         for kind, status in item["source_states"].values():
             if status == "expired":
                 expired_weight += weight_map.get(kind, 0.5)
-            else:
+            elif status == "active":
                 active_weight += weight_map.get(kind, 0.5)
-        item["status"] = "expired" if expired_weight >= active_weight and expired_weight > 0 else "active"
+        if expired_weight >= active_weight and expired_weight > 0:
+            item["status"] = "expired"
+        elif active_weight > 0:
+            item["status"] = "active"
+        else:
+            item["status"] = "review"
 
         if item["expires_at"]:
             try:
@@ -1134,6 +1237,9 @@ def upsert_candidates(con: sqlite3.Connection, merged: dict[tuple[str, str], dic
         status = item["status"]
         if row["used"] and row["status"] == "invalid":
             status = "invalid"
+        elif row["status"] == "expired" and status == "review":
+            # Old evidence cannot undo a previously known expiry.
+            status = "expired"
         elif row["status"] == "expired" and status == "active":
             if old_expiry:
                 # Expired coupons do not become active just because an old
@@ -1314,6 +1420,10 @@ def _run_check_unlocked(cfg: Optional[dict] = None) -> dict:
                 log(f"ERRORE {message}")
 
     merged = merge_candidates(all_candidates)
+    reviewed_old_posts = sum(
+        item["status"] == "review" and item["confidence"].startswith("DATA POST")
+        for item in merged.values()
+    )
     con = connect_db()
     try:
         inserted, new_rows = upsert_candidates(con, merged)
@@ -1355,6 +1465,7 @@ def _run_check_unlocked(cfg: Optional[dict] = None) -> dict:
         "failed_sources": len(failures), "failures": failures,
         "candidates": len(merged), "inserted": inserted,
         "stale_marked": stale_marked, "expired_marked": expired_marked,
+        "old_posts_for_review": reviewed_old_posts,
         "new_rows": new_rows, "notify_rows": list(union.values()),
         "notify_rows_pc": pc_rows, "notify_rows_phone": phone_rows,
         "skipped": False,
@@ -1484,9 +1595,13 @@ def update_code_state(con: sqlite3.Connection, row_ids: list[int], action: str) 
 
 
 def redeem_url_for(game: str, code: str) -> Optional[str]:
-    if game == GAME_GENSHIN:
-        return "https://genshin.hoyoverse.com/en/gift?code=" + quote_plus(code)
-    return None
+    """Solo pagina ufficiale: nessun login, token o invio automatico."""
+    if game != GAME_GENSHIN or not isinstance(code, str):
+        return None
+    token = code.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{4,64}", token):
+        return None
+    return "https://genshin.hoyoverse.com/en/gift?code=" + quote_plus(token)
 
 
 def current_launch_command() -> str:
@@ -1561,86 +1676,165 @@ def gui_main() -> None:
     con = connect_db()
     con.close()
 
-    root = tk.Tk()
-    root.title(f"{APP_NAME} {APP_VERSION}")
-    root.geometry("1160x680")
-    root.minsize(920, 560)
+    from sentinel_ui import PALETTE, apply_theme, metric_card
 
-    status_var = tk.StringVar(value="Pronto. I codici usati sono nascosti per impostazione predefinita.")
+    root = tk.Tk()
+    root.title(f"{APP_NAME}  |  v{APP_VERSION}")
+    root.geometry("1320x780")
+    root.minsize(1070, 640)
+    apply_theme(root)
+
+    status_var = tk.StringVar(value="Pronto. Le fonti vengono controllate all'avvio.")
+    selection_var = tk.StringVar(value="Selezionati: 0")
     show_used = tk.BooleanVar(value=False)
     show_unverified = tk.BooleanVar(value=bool(cfg.get("show_unverified", False)))
     show_archived = tk.BooleanVar(value=False)
     game_filter = tk.StringVar(value="Tutti")
     search_var = tk.StringVar(value="")
     order = {"column": "", "desc": False}
+    stats = {
+        "visible": tk.StringVar(value="—"),
+        "active": tk.StringVar(value="—"),
+        "trusted": tk.StringVar(value="—"),
+    }
 
-    top = ttk.Frame(root, padding=10)
-    top.pack(fill="x")
-    ttk.Label(top, text="GameCode Sentinel", font=("Segoe UI", 18, "bold")).pack(side="left")
-    ttk.Label(top, text="  Codici reali, deduplicati, con livello di verifica", font=("Segoe UI", 10)).pack(side="left", pady=(6, 0))
+    # Sidebar stabile: azioni di configurazione, diagnostica e assistenza.
+    sidebar = ttk.Frame(root, style="Sidebar.TFrame", width=215, padding=(19, 23))
+    sidebar.pack(side="left", fill="y")
+    sidebar.pack_propagate(False)
+    ttk.Label(sidebar, text="◆  GAMECODE", style="Brand.TLabel").pack(anchor="w")
+    ttk.Label(sidebar, text="SENTINEL   /   DESKTOP", style="SidebarNote.TLabel").pack(
+        anchor="w", pady=(4, 30))
+    ttk.Label(sidebar, text="WORKSPACE", style="SidebarHeading.TLabel").pack(
+        anchor="w", pady=(0, 9))
+    ttk.Button(sidebar, text="◈  Panoramica", style="Nav.TButton",
+               command=lambda: refresh()).pack(fill="x", pady=2)
+    ttk.Button(sidebar, text="↻  Controlla codici", style="Nav.TButton",
+               command=lambda: do_check()).pack(fill="x", pady=2)
+    ttk.Button(sidebar, text="◎  Stato fonti", style="Nav.TButton",
+               command=lambda: show_source_health()).pack(fill="x", pady=2)
+    ttk.Button(sidebar, text="▣  Backup locali", style="Nav.TButton",
+               command=lambda: show_backups()).pack(fill="x", pady=2)
+    ttk.Button(sidebar, text="⚙  Impostazioni", style="Nav.TButton",
+               command=lambda: open_settings()).pack(fill="x", pady=2)
+    ttk.Separator(sidebar).pack(fill="x", pady=(28, 17))
+    ttk.Label(sidebar, text="RISCATTO GENSHIN", style="SidebarHeading.TLabel").pack(
+        anchor="w")
+    ttk.Label(sidebar, text="Apertura sito ufficiale con\ncodice precompilato. Login\ne conferma restano manuali.",
+              style="SidebarNote.TLabel", justify="left").pack(anchor="w", pady=(8, 0))
+    ttk.Frame(sidebar, style="Sidebar.TFrame").pack(fill="both", expand=True)
+    ttk.Label(sidebar, text=f"VERSIONE  {APP_VERSION}", style="SidebarNote.TLabel").pack(
+        anchor="w", pady=(8, 0))
+    ttk.Label(sidebar, text="Dati conservati sul PC", style="SidebarNote.TLabel").pack(
+        anchor="w", pady=(3, 0))
 
-    controls = ttk.Frame(root, padding=(10, 0, 10, 8))
-    controls.pack(fill="x")
+    main = ttk.Frame(root, padding=(23, 20, 23, 15))
+    main.pack(side="left", fill="both", expand=True)
 
-    check_btn = ttk.Button(controls, text="Controlla ora")
-    check_btn.pack(side="left", padx=(0, 6))
-    ttk.Button(controls, text="Copia codice", command=lambda: copy_selected()).pack(side="left", padx=3)
-    ttk.Button(controls, text="Riscatta / istruzioni", command=lambda: redeem_selected()).pack(side="left", padx=3)
-    ttk.Button(controls, text="Segna usati", command=lambda: mark_selected("used")).pack(side="left", padx=3)
-    ttk.Button(controls, text="Segna non valido", command=lambda: mark_selected("invalid")).pack(side="left", padx=3)
-    ttk.Button(controls, text="Fonti", command=lambda: show_sources_selected()).pack(side="left", padx=3)
-    ttk.Button(controls, text="Impostazioni", command=lambda: open_settings()).pack(side="right")
-    ttk.Button(controls, text="Stato fonti", command=lambda: show_source_health()).pack(side="right", padx=5)
-    ttk.Button(controls, text="Backup", command=lambda: show_backups()).pack(side="right", padx=5)
+    header = ttk.Frame(main)
+    header.pack(fill="x", pady=(0, 15))
+    header_text = ttk.Frame(header)
+    header_text.pack(side="left", fill="x", expand=True)
+    ttk.Label(header_text, text="Centro codici", style="Title.TLabel").pack(anchor="w")
+    ttk.Label(header_text, text="Monitora le fonti, valuta l'affidabilità e gestisci i riscatti.",
+              style="Subtitle.TLabel").pack(anchor="w", pady=(3, 0))
+    check_btn = ttk.Button(header, text="↻  Controlla ora", style="Primary.TButton")
+    check_btn.pack(side="right", padx=(12, 0), pady=(4, 0))
 
-    filters = ttk.Frame(root, padding=(10, 0, 10, 8))
-    filters.pack(fill="x")
-    ttk.Label(filters, text="Gioco:").pack(side="left")
-    combo = ttk.Combobox(filters, state="readonly", width=20, textvariable=game_filter, values=["Tutti"] + GAMES)
-    combo.pack(side="left", padx=(5, 14))
-    ttk.Label(filters, text="Cerca:").pack(side="left")
-    ttk.Entry(filters, textvariable=search_var, width=19).pack(side="left", padx=(5, 12))
-    ttk.Checkbutton(filters, text="Mostra usati", variable=show_used, command=lambda: refresh()).pack(side="left", padx=5)
-    ttk.Checkbutton(filters, text="Mostra da verificare", variable=show_unverified, command=lambda: refresh()).pack(side="left", padx=5)
-    ttk.Checkbutton(filters, text="Mostra storico/scaduti", variable=show_archived, command=lambda: refresh()).pack(side="left", padx=5)
+    metrics = ttk.Frame(main)
+    metrics.pack(fill="x", pady=(0, 17))
+    for index, (title, key) in enumerate((
+        ("CODICI VISIBILI", "visible"),
+        ("SEGNALATI ATTIVI", "active"),
+        ("AFFIDABILITÀ ≥ 85", "trusted"),
+    )):
+        card = metric_card(metrics, title, stats[key])
+        card.pack(side="left", fill="x", expand=True,
+                  padx=(0, 10) if index < 2 else (0, 0))
 
-    bulk_controls = ttk.Frame(root, padding=(10, 0, 10, 8))
-    bulk_controls.pack(fill="x")
-    ttk.Label(bulk_controls, text="Selezione: Ctrl+clic, Maiusc+clic oppure Ctrl+A").pack(side="left")
-    ttk.Button(bulk_controls, text="Seleziona tutti visibili",
-               command=lambda: select_all_visible()).pack(side="left", padx=(12, 4))
+    filters = ttk.Frame(main)
+    filters.pack(fill="x", pady=(0, 5))
+    ttk.Label(filters, text="Gioco").pack(side="left")
+    combo = ttk.Combobox(filters, state="readonly", width=18, textvariable=game_filter,
+                         values=["Tutti"] + GAMES)
+    combo.pack(side="left", padx=(9, 18))
+    ttk.Label(filters, text="Cerca codice o ricompensa").pack(side="left")
+    ttk.Entry(filters, textvariable=search_var, width=27).pack(
+        side="left", padx=(9, 6), fill="x", expand=True)
+
+    display_filters = ttk.Frame(main)
+    display_filters.pack(fill="x", pady=(1, 13))
+    ttk.Checkbutton(display_filters, text="Includi usati", variable=show_used,
+                    command=lambda: refresh()).pack(side="left", padx=(0, 12))
+    ttk.Checkbutton(display_filters, text="Da verificare", variable=show_unverified,
+                    command=lambda: refresh()).pack(side="left", padx=(0, 12))
+    ttk.Checkbutton(display_filters, text="Storico e scaduti", variable=show_archived,
+                    command=lambda: refresh()).pack(side="left")
+
+    bulk_controls = ttk.Frame(main)
+    bulk_controls.pack(fill="x", pady=(0, 8))
+    ttk.Label(bulk_controls, textvariable=selection_var,
+              style="Subtitle.TLabel").pack(side="left", padx=(0, 10))
+    ttk.Button(bulk_controls, text="Seleziona tutti",
+               command=lambda: select_all_visible()).pack(side="left", padx=(0, 5))
     ttk.Button(bulk_controls, text="Deseleziona",
-               command=lambda: clear_selection()).pack(side="left", padx=4)
+               command=lambda: clear_selection()).pack(side="left", padx=(0, 5))
     ttk.Button(bulk_controls, text="Ripristina usati",
                command=lambda: mark_selected("restore")).pack(side="right")
 
-    cols = ("game", "code", "status", "reward", "verify", "expires", "seen", "last", "sources")
-    tree = ttk.Treeview(root, columns=cols, show="headings", selectmode="extended")
+    table_frame = ttk.Frame(main, style="Surface.TFrame")
+    table_frame.pack(fill="both", expand=True)
+    table_frame.rowconfigure(0, weight=1)
+    table_frame.columnconfigure(0, weight=1)
+    cols = ("game", "code", "status", "verify", "expires", "published", "seen", "last", "sources", "reward")
+    tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="extended")
     headings = {
-        "game": "Gioco", "code": "Codice", "status": "Stato", "reward": "Ricompensa", "verify": "Verifica",
-        "expires": "Scadenza (IT AION)", "seen": "Prima rilevazione", "last": "Ultima vista", "sources": "Fonti",
+        "game": "Gioco", "code": "Codice", "status": "Stato",
+        "verify": "Verifica", "expires": "Scadenza (IT AION)", "published": "Data post",
+        "seen": "Prima rilevazione", "last": "Ultima vista", "sources": "Fonti",
+        "reward": "Ricompensa",
     }
-    widths = {"game": 110, "code": 170, "status": 130, "reward": 310, "verify": 185, "expires": 145, "seen": 135, "last": 135, "sources": 60}
+    widths = {
+        "game": 125, "code": 168, "status": 165,
+        "verify": 165, "expires": 151, "published": 124, "seen": 155, "last": 155, "sources": 62,
+        "reward": 270,
+    }
     for c in cols:
         tree.heading(c, text=headings[c], command=lambda col=c: sort_by(col))
-        tree.column(c, width=widths[c], anchor="w")
-    tree.pack(fill="both", expand=True, padx=10)
-    tree.tag_configure("official", background="#e8f5e9")
-    tree.tag_configure("confirmed", background="#eef6ff")
-    tree.tag_configure("unverified", background="#fff8e1")
-    tree.tag_configure("used", foreground="#777777")
-    tree.tag_configure("archived", foreground="#888888")
+        tree.column(c, width=widths[c], minwidth=65, anchor="w", stretch=True)
+    tree.grid(row=0, column=0, sticky="nsew")
+    scrollbar_y = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+    scrollbar_y.grid(row=0, column=1, sticky="ns")
+    scrollbar_x = ttk.Scrollbar(table_frame, orient="horizontal", command=tree.xview)
+    scrollbar_x.grid(row=1, column=0, sticky="ew")
+    tree.configure(yscrollcommand=scrollbar_y.set, xscrollcommand=scrollbar_x.set)
+    tree.tag_configure("official", background="#173a32", foreground="#b7f7d6")
+    tree.tag_configure("confirmed", background="#1a3049", foreground="#c3e1ff")
+    tree.tag_configure("unverified", background="#44371f", foreground="#ffe7a3")
+    tree.tag_configure("used", background=PALETTE["surface"], foreground="#8d9cb3")
+    tree.tag_configure("archived", background=PALETTE["surface"], foreground="#8d9cb3")
 
-    sb = ttk.Scrollbar(tree, orient="vertical", command=tree.yview)
-    tree.configure(yscrollcommand=sb.set)
-    sb.pack(side="right", fill="y")
+    actions = ttk.Frame(main)
+    actions.pack(fill="x", pady=(11, 0))
+    ttk.Button(actions, text="Copia codice",
+               command=lambda: copy_selected()).pack(side="left", padx=(0, 6))
+    ttk.Button(actions, text="Apri riscatto",
+               style="Primary.TButton", command=lambda: redeem_selected()).pack(
+                   side="left", padx=(0, 6))
+    ttk.Button(actions, text="Segna usati",
+               command=lambda: mark_selected("used")).pack(side="left", padx=(0, 6))
+    ttk.Button(actions, text="Segna non valido",
+               style="Danger.TButton", command=lambda: mark_selected("invalid")).pack(
+                   side="left", padx=(0, 6))
+    ttk.Button(actions, text="Fonti del codice",
+               command=lambda: show_sources_selected()).pack(side="right")
 
-    bottom = ttk.Frame(root, padding=10)
-    bottom.pack(fill="x")
-    ttk.Label(bottom, textvariable=status_var).pack(side="left")
-    selection_var = tk.StringVar(value="Selezionati: 0")
-    ttk.Label(bottom, textvariable=selection_var).pack(side="left", padx=(12, 0))
-    ttk.Label(bottom, text="Verde=ufficiale · Azzurro=confermato · Giallo=da verificare", foreground="#555").pack(side="right")
+    footer = ttk.Frame(main)
+    footer.pack(fill="x", pady=(13, 0))
+    ttk.Label(footer, textvariable=status_var, style="Subtitle.TLabel",
+              wraplength=760).pack(side="left")
+    ttk.Label(footer, text="● Ufficiale   ● Confermato   ● Da verificare",
+              style="Subtitle.TLabel").pack(side="right")
 
     def selected_ids() -> list[int]:
         return [int(item) for item in tree.selection()]
@@ -1772,13 +1966,26 @@ def gui_main() -> None:
                 src_count = len(json.loads(r["sources_json"] or "[]"))
             except Exception:
                 src_count = r["source_count"]
+            post_dates = []
+            try:
+                post_dates = [src.get("published_at", "") for src in json.loads(r["sources_json"] or "[]")
+                              if isinstance(src, dict) and src.get("published_at")]
+            except (ValueError, TypeError):
+                pass
+            newest_post = max(post_dates, default="")
+            post_label = newest_post[:10] if newest_post else "Data non nota"
             seen = (r["first_seen"] or "").replace("T", " ")[:16]
             display_status = {"active": "Segnalato (non garantito)", "expired": "Scaduto", "stale": "Non più rilevato",
                               "review": "Da riverificare", "invalid": "Non valido"}.get(r["status"], r["status"])
             tree.insert("", "end", iid=str(r["id"]), values=(
-                r["game"], r["code"], display_status, r["rewards"] or "—", r["confidence"], r["expires_at"] or "—", seen, (r["last_seen"] or "").replace("T", " ")[:16], r["source_count"],
+                r["game"], r["code"], display_status, r["confidence"], r["expires_at"] or "—",
+                post_label, seen, (r["last_seen"] or "").replace("T", " ")[:16], r["source_count"],
+                r["rewards"] or "—",
             ), tags=(tag,))
-        status_var.set(f"{len(rows)} codici visibili. Database: {DB_PATH}")
+        stats["visible"].set(str(len(rows)))
+        stats["active"].set(str(sum(r["status"] == "active" and not r["used"] for r in rows)))
+        stats["trusted"].set(str(sum(r["status"] == "active" and not r["used"] and r["score"] >= 85 for r in rows)))
+        status_var.set(f"{len(rows)} codici visibili  ·  archivio locale: {DB_PATH}")
         update_selection_count()
 
     def copy_selected():
@@ -1839,10 +2046,18 @@ def gui_main() -> None:
         w.transient(root)
         frm = ttk.Frame(w, padding=10); frm.pack(fill="both", expand=True)
         ttk.Label(frm, text=f"{r['game']} · {r['code']} · {r['confidence']}", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0,8))
-        lb = tk.Listbox(frm, height=12)
+        lb = tk.Listbox(
+            frm, height=12, bg=PALETTE["surface"], fg=PALETTE["text"],
+            selectbackground=PALETTE["accent"], selectforeground="#ffffff",
+            highlightthickness=0, relief="flat", font=("Segoe UI", 10),
+        )
         lb.pack(fill="both", expand=True)
         for src in sources:
-            lb.insert("end", f"[{src.get('kind','')}] {src.get('name','')} — {src.get('url','')}")
+            posted = src.get("published_at", "")
+            age = age_days(posted)
+            date_label = (f"post {posted[:10]} / {age} giorni fa" if age is not None
+                          else "pubblicazione non dichiarata")
+            lb.insert("end", f"[{src.get('kind','')}] {src.get('name','')} ({date_label}) — {src.get('url','')}")
         def open_src():
             sel = lb.curselection()
             if not sel:
@@ -1858,21 +2073,64 @@ def gui_main() -> None:
     def redeem_selected():
         rid = selected_id()
         if rid is None:
-            messagebox.showinfo(APP_NAME, "Seleziona un solo codice.")
+            messagebox.showinfo(APP_NAME, "Seleziona un solo codice.", parent=root)
             return
         r = get_row(rid)
-        if r["status"] != "active":
-            messagebox.showwarning(APP_NAME, "Questo codice non è segnalato come attivo. Controlla le fonti prima di usarlo.")
+        if r is None:
+            refresh()
             return
-        root.clipboard_clear(); root.clipboard_append(r["code"])
+        if r["status"] != "active":
+            messagebox.showwarning(APP_NAME,
+                "Il codice non è segnalato come attivo. Verifica prima le fonti.",
+                parent=root)
+            return
+        if r["used"] and not messagebox.askyesno(
+            APP_NAME, "Questo codice risulta già segnato come usato. Vuoi aprirlo comunque?",
+            parent=root,
+        ):
+            return
+        root.clipboard_clear()
+        root.clipboard_append(r["code"])
         url = redeem_url_for(r["game"], r["code"])
-        if url:
-            webbrowser.open(url)
-            messagebox.showinfo(APP_NAME, f"Ho aperto la pagina ufficiale e copiato {r['code']} negli appunti.\n\nDopo il riscatto premi 'Segna come usato'.")
+        if r["game"] == GAME_GENSHIN:
+            if not url:
+                messagebox.showwarning(APP_NAME,
+                    "Formato codice non valido per il collegamento Genshin. "
+                    "Il testo resta negli appunti.", parent=root)
+                return
+            try:
+                opened = webbrowser.open(url, new=2)
+            except Exception as exc:
+                log(f"Impossibile aprire pagina Genshin: {exc}")
+                opened = False
+            if not opened:
+                messagebox.showwarning(APP_NAME,
+                    "Il browser non ha confermato l'apertura. "
+                    "Puoi incollare il codice copiato nel sito ufficiale:\\n"
+                    "https://genshin.hoyoverse.com/en/gift",
+                    parent=root)
+                return
+            messagebox.showinfo(
+                APP_NAME,
+                f"Pagina HoYoverse aperta con il codice {r['code']} nell'URL.\\n\\n"
+                "Accedi direttamente sul sito, controlla server e personaggio "
+                "e conferma manualmente il riscatto. Se il campo non viene "
+                "precompilato, incolla il codice dagli appunti.\\n\\n"
+                "Segna il codice come usato SOLO dopo l'esito positivo. "
+                "GameCode Sentinel non accede al tuo account.",
+                parent=root,
+            )
+            status_var.set(f"Riscatto assistito aperto: {r['code']}")
         elif r["game"] == GAME_ANIIMO:
-            messagebox.showinfo(APP_NAME, f"Codice copiato: {r['code']}\n\nAniimo: Settings → Account → Gift Code Redemption.\nDopo il riscatto premi 'Segna come usato'.")
+            messagebox.showinfo(APP_NAME,
+                f"Codice copiato: {r['code']}\\n\\n"
+                "Aniimo: Settings → Account → Gift Code Redemption.\\n"
+                "Segna come usato solo dopo il riscatto.", parent=root)
         elif r["game"] == GAME_AION2:
-            messagebox.showinfo(APP_NAME, f"Codice copiato: {r['code']}\n\nAION 2: Settings → Miscellaneous/Other → Account → Coupon Registration.\nDopo il riscatto premi 'Segna come usato'.")
+            messagebox.showinfo(APP_NAME,
+                f"Codice copiato: {r['code']}\\n\\n"
+                "AION 2: Settings → Miscellaneous/Other → Account → Coupon Registration.\\n"
+                "Segna come usato solo dopo il riscatto.", parent=root)
 
     def do_check():
         check_btn.config(state="disabled")
@@ -1890,12 +2148,14 @@ def gui_main() -> None:
                        f"Controllo completato: {result['ok_sources']} fonti OK, {result['inserted']} nuovi codici")
                 if result.get("stale_marked"):
                     msg += f", {result['stale_marked']} non più rilevati nascosti"
+                if result.get("old_posts_for_review"):
+                    msg += f", {result['old_posts_for_review']} codici da vecchi post in revisione"
                 if result["failed_sources"]:
                     msg += f", {result['failed_sources']} fonti non raggiunte"
                 root.after(0, lambda: [refresh(), status_var.set(msg), check_btn.config(state="normal")])
             except Exception as exc:
                 log(f"Check GUI error: {exc}")
-                root.after(0, lambda: [status_var.set(f"Errore: {exc}"), check_btn.config(state="normal")])
+                root.after(0, lambda error=str(exc): [status_var.set(f"Errore: {error}"), check_btn.config(state="normal")])
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1949,13 +2209,13 @@ def gui_main() -> None:
 
         ttk.Label(frm, text="Notifica solo se punteggio ≥").grid(row=6, column=0, sticky="w", pady=(12,0))
         ttk.Spinbox(frm, from_=0, to=100, increment=5, textvariable=min_score, width=7).grid(row=6, column=1, sticky="w", pady=(12,0))
-        ttk.Label(frm, text="85 = ufficiale o confermato da almeno 2 fonti editoriali indipendenti (consigliato)", foreground="#555").grid(row=7, column=0, columnspan=3, sticky="w")
+        ttk.Label(frm, text="85 = ufficiale o confermato da almeno 2 fonti editoriali indipendenti (consigliato)", foreground=PALETTE["muted"]).grid(row=7, column=0, columnspan=3, sticky="w")
 
         help_txt = (
             "Telefono: installa l'app ntfy sul telefono e iscriviti allo stesso topic. "
             "Il topic funziona come un indirizzo: usa quello casuale generato e non condividerlo."
         )
-        ttk.Label(frm, text=help_txt, wraplength=535, foreground="#555").grid(row=8, column=0, columnspan=3, sticky="w", pady=(14,10))
+        ttk.Label(frm, text=help_txt, wraplength=535, foreground=PALETTE["muted"]).grid(row=8, column=0, columnspan=3, sticky="w", pady=(14,10))
 
         buttons = ttk.Frame(frm); buttons.grid(row=9, column=0, columnspan=3, sticky="we", pady=(8,0))
 
@@ -1980,7 +2240,16 @@ def gui_main() -> None:
         frm.columnconfigure(1, weight=1)
 
     combo.bind("<<ComboboxSelected>>", lambda e: refresh())
-    search_var.trace_add("write", lambda *_: refresh())
+    search_timer = None
+
+    def schedule_search(*_args):
+        # Debounce: digitare rapidamente non rilegge l'intero database a ogni tasto.
+        nonlocal search_timer
+        if search_timer is not None:
+            root.after_cancel(search_timer)
+        search_timer = root.after(240, refresh)
+
+    search_var.trace_add("write", schedule_search)
     tree.bind("<Double-1>", lambda e: copy_selected())
     tree.bind("<<TreeviewSelect>>", update_selection_count)
     tree.bind("<Control-a>", select_all_shortcut)

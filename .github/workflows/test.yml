@@ -4,6 +4,8 @@ on:
     branches: [main]
     paths:
       - 'app.py'
+      - 'sentinel_ui.py'
+      - 'sentinel_freshness.py'
       - 'requirements.txt'
       - 'tests/**'
       - '.github/workflows/test.yml'

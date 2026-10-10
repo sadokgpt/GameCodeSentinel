@@ -1923,7 +1923,11 @@ def gui_main() -> None:
         w.transient(root)
         frm = ttk.Frame(w, padding=10); frm.pack(fill="both", expand=True)
         ttk.Label(frm, text=f"{r['game']} · {r['code']} · {r['confidence']}", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0,8))
-        lb = tk.Listbox(frm, height=12)
+        lb = tk.Listbox(
+            frm, height=12, bg=PALETTE["surface"], fg=PALETTE["text"],
+            selectbackground=PALETTE["accent"], selectforeground="#ffffff",
+            highlightthickness=0, relief="flat", font=("Segoe UI", 10),
+        )
         lb.pack(fill="both", expand=True)
         for src in sources:
             lb.insert("end", f"[{src.get('kind','')}] {src.get('name','')} — {src.get('url','')}")
@@ -2076,13 +2080,13 @@ def gui_main() -> None:
 
         ttk.Label(frm, text="Notifica solo se punteggio ≥").grid(row=6, column=0, sticky="w", pady=(12,0))
         ttk.Spinbox(frm, from_=0, to=100, increment=5, textvariable=min_score, width=7).grid(row=6, column=1, sticky="w", pady=(12,0))
-        ttk.Label(frm, text="85 = ufficiale o confermato da almeno 2 fonti editoriali indipendenti (consigliato)", foreground="#555").grid(row=7, column=0, columnspan=3, sticky="w")
+        ttk.Label(frm, text="85 = ufficiale o confermato da almeno 2 fonti editoriali indipendenti (consigliato)", foreground=PALETTE["muted"]).grid(row=7, column=0, columnspan=3, sticky="w")
 
         help_txt = (
             "Telefono: installa l'app ntfy sul telefono e iscriviti allo stesso topic. "
             "Il topic funziona come un indirizzo: usa quello casuale generato e non condividerlo."
         )
-        ttk.Label(frm, text=help_txt, wraplength=535, foreground="#555").grid(row=8, column=0, columnspan=3, sticky="w", pady=(14,10))
+        ttk.Label(frm, text=help_txt, wraplength=535, foreground=PALETTE["muted"]).grid(row=8, column=0, columnspan=3, sticky="w", pady=(14,10))
 
         buttons = ttk.Frame(frm); buttons.grid(row=9, column=0, columnspan=3, sticky="we", pady=(8,0))
 

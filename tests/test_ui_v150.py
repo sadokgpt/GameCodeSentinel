@@ -36,7 +36,7 @@ def test_theme_is_available_without_creating_a_window():
     assert sentinel_ui.PALETTE["background"].startswith("#")
     assert callable(sentinel_ui.apply_theme)
     assert callable(sentinel_ui.metric_card)
-    assert app.APP_VERSION == "1.6.0"
+    assert app.APP_VERSION == "1.7.0"
 
 
 def test_reward_is_last_column_and_last_displayed_value():

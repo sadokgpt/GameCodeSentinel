@@ -121,3 +121,30 @@ def age_days(publication: str, *, now: datetime | None = None) -> Optional[int]:
 def is_old_post(game: str, publication: str, *, now: datetime | None = None) -> bool:
     age = age_days(publication, now=now)
     return age is not None and age > MAX_AGE_DAYS.get(game, 60)
+
+
+# An active listing is an explicit section on a currently fetched editorial
+# tracker page, not an arbitrary article that happens to contain the word
+# "active" somewhere. The website still does NOT prove that redemption works.
+import re
+
+_CURRENT_CODES = re.compile(
+    r"(?i)\\b(?:active|working|valid|current|available|new)\\b"
+    r".{0,65}\\b(?:codes?|coupons?)\\b"
+    r"|\\b(?:codes?|coupons?)\\b.{0,35}\\b(?:active|working|valid)\\b"
+)
+_INACTIVE_CODES = re.compile(
+    r"(?i)\\b(?:expired|inactive|invalid|old|outdated|previous|"
+    r"no longer|not working|non validi|scadut[oaie])\\b"
+)
+
+
+def is_active_tracker_heading(heading: str, *, source_kind: str, source_mode: str) -> bool:
+    if source_kind != "secondary" or source_mode != "page":
+        return False
+    heading = (heading or "").strip()
+    return (
+        len(heading) <= 150
+        and not _INACTIVE_CODES.search(heading)
+        and bool(_CURRENT_CODES.search(heading))
+    )

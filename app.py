@@ -1786,16 +1786,18 @@ def gui_main() -> None:
     table_frame.pack(fill="both", expand=True)
     table_frame.rowconfigure(0, weight=1)
     table_frame.columnconfigure(0, weight=1)
-    cols = ("game", "code", "status", "reward", "verify", "expires", "published", "seen", "last", "sources")
+    cols = ("game", "code", "status", "verify", "expires", "published", "seen", "last", "sources", "reward")
     tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="extended")
     headings = {
-        "game": "Gioco", "code": "Codice", "status": "Stato", "reward": "Ricompensa",
+        "game": "Gioco", "code": "Codice", "status": "Stato",
         "verify": "Verifica", "expires": "Scadenza (IT AION)", "published": "Data post",
         "seen": "Prima rilevazione", "last": "Ultima vista", "sources": "Fonti",
+        "reward": "Ricompensa",
     }
     widths = {
-        "game": 125, "code": 168, "status": 165, "reward": 270,
+        "game": 125, "code": 168, "status": 165,
         "verify": 165, "expires": 151, "published": 124, "seen": 155, "last": 155, "sources": 62,
+        "reward": 270,
     }
     for c in cols:
         tree.heading(c, text=headings[c], command=lambda col=c: sort_by(col))
@@ -1976,7 +1978,9 @@ def gui_main() -> None:
             display_status = {"active": "Segnalato (non garantito)", "expired": "Scaduto", "stale": "Non più rilevato",
                               "review": "Da riverificare", "invalid": "Non valido"}.get(r["status"], r["status"])
             tree.insert("", "end", iid=str(r["id"]), values=(
-                r["game"], r["code"], display_status, r["rewards"] or "—", r["confidence"], r["expires_at"] or "—", post_label, seen, (r["last_seen"] or "").replace("T", " ")[:16], r["source_count"],
+                r["game"], r["code"], display_status, r["confidence"], r["expires_at"] or "—",
+                post_label, seen, (r["last_seen"] or "").replace("T", " ")[:16], r["source_count"],
+                r["rewards"] or "—",
             ), tags=(tag,))
         stats["visible"].set(str(len(rows)))
         stats["active"].set(str(sum(r["status"] == "active" and not r["used"] for r in rows)))

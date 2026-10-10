@@ -15,7 +15,7 @@ import webbrowser
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from sentinel_freshness import extract_page_dates, parse_publication_time, is_old_post
+from sentinel_freshness import extract_page_dates, parse_publication_time, is_old_post, age_days
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Iterable, Optional
@@ -839,15 +839,33 @@ def flatten_reddit_comments(node, texts: list[str]) -> None:
             flatten_reddit_comments(item, texts)
 
 
-def reddit_comment_texts(session: requests.Session, permalink: str) -> list[str]:
+def reddit_comment_entries(session: requests.Session, permalink: str) -> list[tuple[str, str]]:
+    """Include each comment's timestamp, not the age of the parent thread."""
     if not permalink:
         return []
     url = "https://www.reddit.com" + permalink.rstrip("/") + ".json?limit=35&depth=2&raw_json=1"
-    r = http_get(session, url)
-    payload = r.json()
-    texts: list[str] = []
-    flatten_reddit_comments(payload, texts)
-    return texts[:120]
+    payload = http_get(session, url).json()
+    entries: list[tuple[str, str]] = []
+
+    def visit(node):
+        if isinstance(node, dict):
+            data = node.get("data")
+            if node.get("kind") == "t1" and isinstance(data, dict):
+                body = data.get("body")
+                if isinstance(body, str) and body:
+                    entries.append((body, parse_publication_time(data.get("created_utc"))))
+            for val in node.values():
+                visit(val)
+        elif isinstance(node, list):
+            for val in node:
+                visit(val)
+
+    visit(payload)
+    return entries[:120]
+
+
+def reddit_comment_texts(session: requests.Session, permalink: str) -> list[str]:
+    return [body for body, _ in reddit_comment_entries(session, permalink)]
 
 
 def reddit_confirmation_counts_from_texts(texts: list[str], code: str = "", unique_code_in_post: bool = True) -> tuple[int, int]:
@@ -899,6 +917,8 @@ def fetch_reddit_source(session: requests.Session, source: Source, cfg: dict) ->
             posted = parse_publication_time(data.get("created_utc"))
             for cand in found:
                 cand.published_at = posted
+                if not posted and cand.status == "active":
+                    cand.status = "review"
 
             # Search a small number of relevant recent comment threads too. This catches
             # codes posted only in megathread comments while keeping the daily request load low.
@@ -906,12 +926,16 @@ def fetch_reddit_source(session: requests.Session, source: Source, cfg: dict) ->
             comment_texts: list[str] = []
             if permalink and idx < 5:
                 try:
-                    comment_texts = reddit_comment_texts(session, permalink)
-                    if comment_texts:
-                        comment_html = "<div>" + "".join(
-                            f"<p>{html_lib.escape(t)}</p>" for t in comment_texts
-                        ) + "</div>"
-                        comment_found = extract_candidates_html(source.game, comment_html, source, post_url)
+                    dated_comments = reddit_comment_entries(session, permalink)
+                    comment_texts = [body for body, _ in dated_comments]
+                    for body_text, comment_date in dated_comments:
+                        comment_html = f"<div><p>{html_lib.escape(body_text)}</p></div>"
+                        extracted = extract_candidates_html(source.game, comment_html, source, post_url)
+                        for cand in extracted:
+                            cand.published_at = comment_date
+                            if not comment_date and cand.status == "active":
+                                cand.status = "review"
+                        comment_found.extend(extracted)
                 except Exception as exc:
                     log(f"Reddit comment scan fallito {post_url}: {exc}")
 
@@ -951,6 +975,8 @@ def fetch_reddit_source(session: requests.Session, source: Source, cfg: dict) ->
             for cand in from_atom:
                 cand.published_at = parse_publication_time(atom_pub.text if atom_pub is not None else "")
                 cand.updated_at = parse_publication_time(atom_mod.text if atom_mod is not None else "")
+                if not cand.published_at and cand.status == "active":
+                    cand.status = "review"
             candidates.extend(from_atom)
         return candidates, 1
 
@@ -1176,6 +1202,9 @@ def upsert_candidates(con: sqlite3.Connection, merged: dict[tuple[str, str], dic
         status = item["status"]
         if row["used"] and row["status"] == "invalid":
             status = "invalid"
+        elif row["status"] == "expired" and status == "review":
+            # Old evidence cannot undo a previously known expiry.
+            status = "expired"
         elif row["status"] == "expired" and status == "active":
             if old_expiry:
                 # Expired coupons do not become active just because an old
@@ -1356,6 +1385,10 @@ def _run_check_unlocked(cfg: Optional[dict] = None) -> dict:
                 log(f"ERRORE {message}")
 
     merged = merge_candidates(all_candidates)
+    reviewed_old_posts = sum(
+        item["status"] == "review" and item["confidence"].startswith("DATA POST")
+        for item in merged.values()
+    )
     con = connect_db()
     try:
         inserted, new_rows = upsert_candidates(con, merged)
@@ -1397,6 +1430,7 @@ def _run_check_unlocked(cfg: Optional[dict] = None) -> dict:
         "failed_sources": len(failures), "failures": failures,
         "candidates": len(merged), "inserted": inserted,
         "stale_marked": stale_marked, "expired_marked": expired_marked,
+        "old_posts_for_review": reviewed_old_posts,
         "new_rows": new_rows, "notify_rows": list(union.values()),
         "notify_rows_pc": pc_rows, "notify_rows_phone": phone_rows,
         "skipped": False,
@@ -1717,16 +1751,16 @@ def gui_main() -> None:
     table_frame.pack(fill="both", expand=True)
     table_frame.rowconfigure(0, weight=1)
     table_frame.columnconfigure(0, weight=1)
-    cols = ("game", "code", "status", "reward", "verify", "expires", "seen", "last", "sources")
+    cols = ("game", "code", "status", "reward", "verify", "expires", "published", "seen", "last", "sources")
     tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="extended")
     headings = {
         "game": "Gioco", "code": "Codice", "status": "Stato", "reward": "Ricompensa",
-        "verify": "Verifica", "expires": "Scadenza (IT AION)",
+        "verify": "Verifica", "expires": "Scadenza (IT AION)", "published": "Data post",
         "seen": "Prima rilevazione", "last": "Ultima vista", "sources": "Fonti",
     }
     widths = {
         "game": 125, "code": 168, "status": 165, "reward": 270,
-        "verify": 165, "expires": 151, "seen": 155, "last": 155, "sources": 62,
+        "verify": 165, "expires": 151, "published": 124, "seen": 155, "last": 155, "sources": 62,
     }
     for c in cols:
         tree.heading(c, text=headings[c], command=lambda col=c: sort_by(col))
@@ -1895,11 +1929,19 @@ def gui_main() -> None:
                 src_count = len(json.loads(r["sources_json"] or "[]"))
             except Exception:
                 src_count = r["source_count"]
+            post_dates = []
+            try:
+                post_dates = [src.get("published_at", "") for src in json.loads(r["sources_json"] or "[]")
+                              if isinstance(src, dict) and src.get("published_at")]
+            except (ValueError, TypeError):
+                pass
+            newest_post = max(post_dates, default="")
+            post_label = newest_post[:10] if newest_post else "Data non nota"
             seen = (r["first_seen"] or "").replace("T", " ")[:16]
             display_status = {"active": "Segnalato (non garantito)", "expired": "Scaduto", "stale": "Non più rilevato",
                               "review": "Da riverificare", "invalid": "Non valido"}.get(r["status"], r["status"])
             tree.insert("", "end", iid=str(r["id"]), values=(
-                r["game"], r["code"], display_status, r["rewards"] or "—", r["confidence"], r["expires_at"] or "—", seen, (r["last_seen"] or "").replace("T", " ")[:16], r["source_count"],
+                r["game"], r["code"], display_status, r["rewards"] or "—", r["confidence"], r["expires_at"] or "—", post_label, seen, (r["last_seen"] or "").replace("T", " ")[:16], r["source_count"],
             ), tags=(tag,))
         stats["visible"].set(str(len(rows)))
         stats["active"].set(str(sum(r["status"] == "active" and not r["used"] for r in rows)))
@@ -1972,7 +2014,11 @@ def gui_main() -> None:
         )
         lb.pack(fill="both", expand=True)
         for src in sources:
-            lb.insert("end", f"[{src.get('kind','')}] {src.get('name','')} — {src.get('url','')}")
+            posted = src.get("published_at", "")
+            age = age_days(posted)
+            date_label = (f"post {posted[:10]} / {age} giorni fa" if age is not None
+                          else "pubblicazione non dichiarata")
+            lb.insert("end", f"[{src.get('kind','')}] {src.get('name','')} ({date_label}) — {src.get('url','')}")
         def open_src():
             sel = lb.curselection()
             if not sel:
@@ -2063,6 +2109,8 @@ def gui_main() -> None:
                        f"Controllo completato: {result['ok_sources']} fonti OK, {result['inserted']} nuovi codici")
                 if result.get("stale_marked"):
                     msg += f", {result['stale_marked']} non più rilevati nascosti"
+                if result.get("old_posts_for_review"):
+                    msg += f", {result['old_posts_for_review']} codici da vecchi post in revisione"
                 if result["failed_sources"]:
                     msg += f", {result['failed_sources']} fonti non raggiunte"
                 root.after(0, lambda: [refresh(), status_var.set(msg), check_btn.config(state="normal")])

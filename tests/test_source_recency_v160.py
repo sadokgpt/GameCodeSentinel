@@ -122,3 +122,25 @@ def test_age_boundary_is_explicit():
     assert not is_old_post(app.GAME_GENSHIN, "2026-09-11T12:00:00Z", now=now)
     assert is_old_post(app.GAME_GENSHIN, "2026-09-08T12:00:00Z", now=now)
     assert not is_old_post(app.GAME_GENSHIN, "", now=now)
+
+
+def test_preupgrade_active_history_is_quarantined_without_losing_user_flags(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(app, "DB_PATH", tmp_path / "codes.db")
+    monkeypatch.setattr(app, "LOG_PATH", tmp_path / "app.log")
+    con = app.connect_db()
+    recent_undated = app.Candidate(app.GAME_GENSHIN, "OLDHISTORY123", "",
+                                   "Old tracker", "https://example.org",
+                                   "secondary")
+    app.upsert_candidates(con, app.merge_candidates([recent_undated]))
+    con.execute("UPDATE codes SET notified_pc=1 WHERE normalized='OLDHISTORY123'")
+    con.execute("DELETE FROM meta WHERE key='post_provenance_review_v160'")
+    con.commit()
+    con.close()
+
+    con = app.connect_db()
+    row = con.execute("SELECT status, score, notified_pc FROM codes WHERE normalized='OLDHISTORY123'").fetchone()
+    assert row["status"] == "review" and row["score"] == 0
+    assert row["notified_pc"] == 1
+    assert list((tmp_path / "backups").glob("codes-*.sqlite3"))
+    con.close()

@@ -9,6 +9,13 @@ on:
       - 'tests/**'
       - '.github/workflows/build-windows.yml'
   workflow_dispatch:
+  pull_request:
+    paths:
+      - 'app.py'
+      - 'sentinel_ui.py'
+      - 'requirements.txt'
+      - 'tests/**'
+      - '.github/workflows/build-windows.yml'
 permissions:
   contents: write
 concurrency:

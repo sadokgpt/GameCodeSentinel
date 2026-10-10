@@ -37,3 +37,32 @@ def test_theme_is_available_without_creating_a_window():
     assert callable(sentinel_ui.apply_theme)
     assert callable(sentinel_ui.metric_card)
     assert app.APP_VERSION == "1.6.0"
+
+
+def test_reward_is_last_column_and_last_displayed_value():
+    """Keep the GUI column layout and Treeview values in sync without opening Tk."""
+    import ast
+    import inspect
+    import textwrap
+
+    gui_tree = ast.parse(textwrap.dedent(inspect.getsource(app.gui_main)))
+    columns = [
+        node for node in ast.walk(gui_tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "cols"
+                for target in node.targets)
+    ]
+    assert len(columns) == 1
+    assert ast.literal_eval(columns[0].value)[-1] == "reward"
+
+    inserts = [
+        call for call in ast.walk(gui_tree)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "tree" and call.func.attr == "insert"
+    ]
+    assert len(inserts) == 1
+    values = next(kw.value for kw in inserts[0].keywords if kw.arg == "values")
+    assert isinstance(values, ast.Tuple)
+    assert len(values.elts) == len(ast.literal_eval(columns[0].value))
+    assert ast.unparse(values.elts[-1]) == "r['rewards'] or '—'"

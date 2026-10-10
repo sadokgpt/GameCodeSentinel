@@ -6,6 +6,7 @@ on:
       - 'app.py'
       - 'sentinel_ui.py'
       - 'sentinel_freshness.py'
+      - 'sentinel_table.py'
       - 'requirements.txt'
       - 'tests/**'
       - '.github/workflows/test.yml'

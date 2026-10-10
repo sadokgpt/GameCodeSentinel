@@ -36,4 +36,4 @@ def test_theme_is_available_without_creating_a_window():
     assert sentinel_ui.PALETTE["background"].startswith("#")
     assert callable(sentinel_ui.apply_theme)
     assert callable(sentinel_ui.metric_card)
-    assert app.APP_VERSION == "1.5.0"
+    assert app.APP_VERSION == "1.6.0"

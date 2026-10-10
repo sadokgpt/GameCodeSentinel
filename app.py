@@ -14,7 +14,8 @@ import time
 import webbrowser
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
+from sentinel_freshness import extract_page_dates, parse_publication_time, is_old_post, age_days
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Iterable, Optional
@@ -32,7 +33,7 @@ except Exception:
     search_dates = None
 
 APP_NAME = "GameCodeSentinel"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (+local Windows code tracker; contact: local-user)"
 REQUEST_TIMEOUT = 18
 MAX_CRAWL_LINKS = 14
@@ -120,6 +121,8 @@ class Candidate:
     context: str = ""
     reddit_confirmations: int = 0
     reddit_negatives: int = 0
+    published_at: str = ""
+    updated_at: str = ""
 
     @property
     def normalized(self) -> str:
@@ -284,6 +287,41 @@ def connect_db() -> sqlite3.Connection:
                 "WHERE id=?", (row["id"],)
             )
         con.execute("INSERT INTO meta(key, value) VALUES('aion_code_shape_review_v131','1')")
+
+    # Version 1.5 and older did not store post publication timestamps.
+    # Existing active entries with no dated evidence must be re-reviewed,
+    # otherwise a repost from 2022 can remain 'confirmed' forever.
+    reviewed = con.execute(
+        "SELECT value FROM meta WHERE key='post_provenance_review_v160'"
+    ).fetchone()
+    if reviewed is None:
+        legacy = []
+        # Very old v1 databases may not yet have modern columns. Do not break
+        # their startup or interfere with the existing v1 notification migration.
+        if {"id", "status", "used", "sources_json"} <= existing_cols:
+            legacy_rows = con.execute(
+                "SELECT id, sources_json FROM codes WHERE status='active' AND used=0"
+            ).fetchall()
+        else:
+            legacy_rows = []
+        for row in legacy_rows:
+            try:
+                sources = json.loads(row["sources_json"] or "[]")
+            except (ValueError, TypeError):
+                sources = []
+            if not any(isinstance(src, dict) and src.get("published_at") for src in sources):
+                legacy.append((row["id"],))
+        if legacy:
+            con.commit()
+            # Consistent backup BEFORE quarantine; historical rows are preserved.
+            backup_sqlite(DB_PATH, force=True)
+            con.executemany(
+                "UPDATE codes SET status='review', score=0, "
+                "confidence='STORICO PRECEDENTE / DATA POST DA RIVERIFICARE' WHERE id=?",
+                legacy,
+            )
+            log(f"Riverifica date: {len(legacy)} vecchi codici senza origine temporale")
+        con.execute("INSERT INTO meta(key, value) VALUES('post_provenance_review_v160','1')")
     con.commit()
     return con
 
@@ -785,9 +823,18 @@ def discover_crawl_links(base_url: str, raw_html: str, link_hint: str = "") -> l
     return links
 
 
+def enrich_with_page_dates(candidates: list[Candidate], html: str) -> list[Candidate]:
+    """Attribute the actual fetched page date, never the scanner's download time."""
+    published, updated = extract_page_dates(html)
+    for cand in candidates:
+        cand.published_at = published
+        cand.updated_at = updated
+    return candidates
+
+
 def fetch_page_source(session: requests.Session, source: Source) -> tuple[list[Candidate], int]:
     resp = http_get(session, source.url)
-    found = extract_candidates_html(source.game, resp.text, source, resp.url)
+    found = enrich_with_page_dates(extract_candidates_html(source.game, resp.text, source, resp.url), resp.text)
     # A soft-404 / cookie wall returning HTTP 200 is NOT reliable evidence
     # that codes previously listed by a tracker have gone away.
     if source.kind == "secondary" and not found and not plausible_tracker_page(resp.text, source.game):
@@ -800,12 +847,12 @@ def fetch_crawl_source(session: requests.Session, source: Source) -> tuple[list[
     first_html = resp.text
     links = discover_crawl_links(resp.url, first_html, source.link_hint)
 
-    all_candidates = extract_candidates_html(source.game, first_html, source, resp.url)
+    all_candidates = enrich_with_page_dates(extract_candidates_html(source.game, first_html, source, resp.url), first_html)
     fetched = 1
     for href in links:
         try:
             r = http_get(session, href)
-            all_candidates.extend(extract_candidates_html(source.game, r.text, source, r.url))
+            all_candidates.extend(enrich_with_page_dates(extract_candidates_html(source.game, r.text, source, r.url), r.text))
             fetched += 1
             time.sleep(0.12)
         except Exception as exc:
@@ -827,15 +874,33 @@ def flatten_reddit_comments(node, texts: list[str]) -> None:
             flatten_reddit_comments(item, texts)
 
 
-def reddit_comment_texts(session: requests.Session, permalink: str) -> list[str]:
+def reddit_comment_entries(session: requests.Session, permalink: str) -> list[tuple[str, str]]:
+    """Include each comment's timestamp, not the age of the parent thread."""
     if not permalink:
         return []
     url = "https://www.reddit.com" + permalink.rstrip("/") + ".json?limit=35&depth=2&raw_json=1"
-    r = http_get(session, url)
-    payload = r.json()
-    texts: list[str] = []
-    flatten_reddit_comments(payload, texts)
-    return texts[:120]
+    payload = http_get(session, url).json()
+    entries: list[tuple[str, str]] = []
+
+    def visit(node):
+        if isinstance(node, dict):
+            data = node.get("data")
+            if node.get("kind") == "t1" and isinstance(data, dict):
+                body = data.get("body")
+                if isinstance(body, str) and body:
+                    entries.append((body, parse_publication_time(data.get("created_utc"))))
+            for val in node.values():
+                visit(val)
+        elif isinstance(node, list):
+            for val in node:
+                visit(val)
+
+    visit(payload)
+    return entries[:120]
+
+
+def reddit_comment_texts(session: requests.Session, permalink: str) -> list[str]:
+    return [body for body, _ in reddit_comment_entries(session, permalink)]
 
 
 def reddit_confirmation_counts_from_texts(texts: list[str], code: str = "", unique_code_in_post: bool = True) -> tuple[int, int]:
@@ -884,6 +949,11 @@ def fetch_reddit_source(session: requests.Session, source: Source, cfg: dict) ->
             post_url = "https://www.reddit.com" + permalink if permalink else data.get("url", url)
             post_html = f"<h1>{html_lib.escape(title)}</h1><p>{html_lib.escape(body)}</p>"
             found = extract_candidates_html(source.game, post_html, source, post_url)
+            posted = parse_publication_time(data.get("created_utc"))
+            for cand in found:
+                cand.published_at = posted
+                if not posted and cand.status == "active":
+                    cand.status = "review"
 
             # Search a small number of relevant recent comment threads too. This catches
             # codes posted only in megathread comments while keeping the daily request load low.
@@ -891,12 +961,16 @@ def fetch_reddit_source(session: requests.Session, source: Source, cfg: dict) ->
             comment_texts: list[str] = []
             if permalink and idx < 5:
                 try:
-                    comment_texts = reddit_comment_texts(session, permalink)
-                    if comment_texts:
-                        comment_html = "<div>" + "".join(
-                            f"<p>{html_lib.escape(t)}</p>" for t in comment_texts
-                        ) + "</div>"
-                        comment_found = extract_candidates_html(source.game, comment_html, source, post_url)
+                    dated_comments = reddit_comment_entries(session, permalink)
+                    comment_texts = [body for body, _ in dated_comments]
+                    for body_text, comment_date in dated_comments:
+                        comment_html = f"<div><p>{html_lib.escape(body_text)}</p></div>"
+                        extracted = extract_candidates_html(source.game, comment_html, source, post_url)
+                        for cand in extracted:
+                            cand.published_at = comment_date
+                            if not comment_date and cand.status == "active":
+                                cand.status = "review"
+                        comment_found.extend(extracted)
                 except Exception as exc:
                     log(f"Reddit comment scan fallito {post_url}: {exc}")
 
@@ -930,7 +1004,15 @@ def fetch_reddit_source(session: requests.Session, source: Source, cfg: dict) ->
             body = "" if content_node is None else "".join(content_node.itertext()).strip()
             post_url = rss_url if link_node is None else link_node.attrib.get("href", rss_url)
             post_html = f"<h1>{title}</h1><div>{body}</div>"
-            candidates.extend(extract_candidates_html(source.game, post_html, source, post_url))
+            from_atom = extract_candidates_html(source.game, post_html, source, post_url)
+            atom_pub = entry.find("{*}published")
+            atom_mod = entry.find("{*}updated")
+            for cand in from_atom:
+                cand.published_at = parse_publication_time(atom_pub.text if atom_pub is not None else "")
+                cand.updated_at = parse_publication_time(atom_mod.text if atom_mod is not None else "")
+                if not cand.published_at and cand.status == "active":
+                    cand.status = "review"
+            candidates.extend(from_atom)
         return candidates, 1
 
     return candidates, 1
@@ -966,7 +1048,10 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
 
         src_key = (c.source_name, c.source_url)
         if not any((src["name"], src["url"]) == src_key for src in item["sources"]):
-            item["sources"].append({"name": c.source_name, "url": c.source_url, "kind": c.source_kind})
+            item["sources"].append({
+                "name": c.source_name, "url": c.source_url, "kind": c.source_kind,
+                "published_at": c.published_at, "updated_at": c.updated_at,
+            })
 
         rank = rank_map.get(c.source_kind, 0)
         # Important for case-sensitive games such as Aniimo: preserve spelling from
@@ -982,8 +1067,13 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
         # Multiple posts/pages from the same source do not get multiple votes.
         # If the same source contains both an active and historical expired occurrence,
         # prefer the current active occurrence.
-        if state is None or (state[1] != "active" and c.status == "active"):
-            item["source_states"][c.source_name] = (c.source_kind, c.status)
+        # A dated old mention must not be interpreted as a fresh confirmation.
+        # It remains visible in the history; its status becomes "review", not expired.
+        evidence_status = ("review" if c.status == "active" and
+                           is_old_post(c.game, c.published_at) else c.status)
+        priority = {"active": 3, "expired": 2, "review": 1}
+        if state is None or priority[evidence_status] > priority[state[1]]:
+            item["source_states"][c.source_name] = (c.source_kind, evidence_status)
 
         if c.expires_at:
             # Prefer an official expiry over tracker/community dates. When
@@ -1001,8 +1091,14 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
         item["negatives"] = max(item["negatives"], c.reddit_negatives)
 
     for item in merged.values():
+        # Only current undated/fresh evidence contributes to the confidence score.
+        # An old post is NOT a vote even when it comes from an official channel.
+        trusted_sources = {
+            name: kind for name, (kind, status) in item["source_states"].items()
+            if status == "active"
+        }
         unique_sources = {name: kind_status[0] for name, kind_status in item["source_states"].items()}
-        kinds = list(unique_sources.values())
+        kinds = list(trusted_sources.values())
         official = "official" in kinds
         source_count = len(unique_sources)
         positives = item["confirmations"]
@@ -1016,10 +1112,12 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
                 return "publisher:gamurs"
             return "source:" + name.casefold()
 
-        secondary_count = len({editorial_group(name) for name, kind in unique_sources.items() if kind == "secondary"})
+        secondary_count = len({editorial_group(name) for name, kind in trusted_sources.items() if kind == "secondary"})
         community_count = sum(1 for kind in kinds if kind == "community")
 
-        if official:
+        if not trusted_sources:
+            score, conf = 0, "DATA POST OBSOLETA / DA RIVERIFICARE"
+        elif official:
             score, conf = 100, "UFFICIALE"
         elif secondary_count >= 2:
             score, conf = 90, "CONFERMATO (2+ fonti note)"
@@ -1043,9 +1141,14 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
         for kind, status in item["source_states"].values():
             if status == "expired":
                 expired_weight += weight_map.get(kind, 0.5)
-            else:
+            elif status == "active":
                 active_weight += weight_map.get(kind, 0.5)
-        item["status"] = "expired" if expired_weight >= active_weight and expired_weight > 0 else "active"
+        if expired_weight >= active_weight and expired_weight > 0:
+            item["status"] = "expired"
+        elif active_weight > 0:
+            item["status"] = "active"
+        else:
+            item["status"] = "review"
 
         if item["expires_at"]:
             try:
@@ -1134,6 +1237,9 @@ def upsert_candidates(con: sqlite3.Connection, merged: dict[tuple[str, str], dic
         status = item["status"]
         if row["used"] and row["status"] == "invalid":
             status = "invalid"
+        elif row["status"] == "expired" and status == "review":
+            # Old evidence cannot undo a previously known expiry.
+            status = "expired"
         elif row["status"] == "expired" and status == "active":
             if old_expiry:
                 # Expired coupons do not become active just because an old
@@ -1314,6 +1420,10 @@ def _run_check_unlocked(cfg: Optional[dict] = None) -> dict:
                 log(f"ERRORE {message}")
 
     merged = merge_candidates(all_candidates)
+    reviewed_old_posts = sum(
+        item["status"] == "review" and item["confidence"].startswith("DATA POST")
+        for item in merged.values()
+    )
     con = connect_db()
     try:
         inserted, new_rows = upsert_candidates(con, merged)
@@ -1355,6 +1465,7 @@ def _run_check_unlocked(cfg: Optional[dict] = None) -> dict:
         "failed_sources": len(failures), "failures": failures,
         "candidates": len(merged), "inserted": inserted,
         "stale_marked": stale_marked, "expired_marked": expired_marked,
+        "old_posts_for_review": reviewed_old_posts,
         "new_rows": new_rows, "notify_rows": list(union.values()),
         "notify_rows_pc": pc_rows, "notify_rows_phone": phone_rows,
         "skipped": False,
@@ -1675,16 +1786,18 @@ def gui_main() -> None:
     table_frame.pack(fill="both", expand=True)
     table_frame.rowconfigure(0, weight=1)
     table_frame.columnconfigure(0, weight=1)
-    cols = ("game", "code", "status", "reward", "verify", "expires", "seen", "last", "sources")
+    cols = ("game", "code", "status", "verify", "expires", "published", "seen", "last", "sources", "reward")
     tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="extended")
     headings = {
-        "game": "Gioco", "code": "Codice", "status": "Stato", "reward": "Ricompensa",
-        "verify": "Verifica", "expires": "Scadenza (IT AION)",
+        "game": "Gioco", "code": "Codice", "status": "Stato",
+        "verify": "Verifica", "expires": "Scadenza (IT AION)", "published": "Data post",
         "seen": "Prima rilevazione", "last": "Ultima vista", "sources": "Fonti",
+        "reward": "Ricompensa",
     }
     widths = {
-        "game": 125, "code": 168, "status": 165, "reward": 270,
-        "verify": 165, "expires": 151, "seen": 155, "last": 155, "sources": 62,
+        "game": 125, "code": 168, "status": 165,
+        "verify": 165, "expires": 151, "published": 124, "seen": 155, "last": 155, "sources": 62,
+        "reward": 270,
     }
     for c in cols:
         tree.heading(c, text=headings[c], command=lambda col=c: sort_by(col))
@@ -1853,11 +1966,21 @@ def gui_main() -> None:
                 src_count = len(json.loads(r["sources_json"] or "[]"))
             except Exception:
                 src_count = r["source_count"]
+            post_dates = []
+            try:
+                post_dates = [src.get("published_at", "") for src in json.loads(r["sources_json"] or "[]")
+                              if isinstance(src, dict) and src.get("published_at")]
+            except (ValueError, TypeError):
+                pass
+            newest_post = max(post_dates, default="")
+            post_label = newest_post[:10] if newest_post else "Data non nota"
             seen = (r["first_seen"] or "").replace("T", " ")[:16]
             display_status = {"active": "Segnalato (non garantito)", "expired": "Scaduto", "stale": "Non più rilevato",
                               "review": "Da riverificare", "invalid": "Non valido"}.get(r["status"], r["status"])
             tree.insert("", "end", iid=str(r["id"]), values=(
-                r["game"], r["code"], display_status, r["rewards"] or "—", r["confidence"], r["expires_at"] or "—", seen, (r["last_seen"] or "").replace("T", " ")[:16], r["source_count"],
+                r["game"], r["code"], display_status, r["confidence"], r["expires_at"] or "—",
+                post_label, seen, (r["last_seen"] or "").replace("T", " ")[:16], r["source_count"],
+                r["rewards"] or "—",
             ), tags=(tag,))
         stats["visible"].set(str(len(rows)))
         stats["active"].set(str(sum(r["status"] == "active" and not r["used"] for r in rows)))
@@ -1930,7 +2053,11 @@ def gui_main() -> None:
         )
         lb.pack(fill="both", expand=True)
         for src in sources:
-            lb.insert("end", f"[{src.get('kind','')}] {src.get('name','')} — {src.get('url','')}")
+            posted = src.get("published_at", "")
+            age = age_days(posted)
+            date_label = (f"post {posted[:10]} / {age} giorni fa" if age is not None
+                          else "pubblicazione non dichiarata")
+            lb.insert("end", f"[{src.get('kind','')}] {src.get('name','')} ({date_label}) — {src.get('url','')}")
         def open_src():
             sel = lb.curselection()
             if not sel:
@@ -2021,6 +2148,8 @@ def gui_main() -> None:
                        f"Controllo completato: {result['ok_sources']} fonti OK, {result['inserted']} nuovi codici")
                 if result.get("stale_marked"):
                     msg += f", {result['stale_marked']} non più rilevati nascosti"
+                if result.get("old_posts_for_review"):
+                    msg += f", {result['old_posts_for_review']} codici da vecchi post in revisione"
                 if result["failed_sources"]:
                     msg += f", {result['failed_sources']} fonti non raggiunte"
                 root.after(0, lambda: [refresh(), status_var.set(msg), check_btn.config(state="normal")])

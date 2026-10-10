@@ -1,10 +1,10 @@
-# GameCode Sentinel 1.4.0
+# GameCode Sentinel 1.5.0
 
 Windows tracker for **AION 2**, **Genshin Impact** and **Aniimo** redemption codes. Local SQLite database; notifications are optional. Code detection is probabilistic: a published string is not proof it can be redeemed. Version 1.3.2 rejects common AION 2 reward names accidentally tagged as codes and quarantines previously stored suspicious Reddit entries.
 
 ## Windows (without Python)
 
-After a successful GitHub Actions run, download the `GameCodeSentinel-Windows-v1.4.0` artifact from the **Build Windows EXE** workflow, unzip, and run `GameCodeSentinel.exe`. Windows SmartScreen may warn for an unsigned executable. Only install software you trust.
+After a successful GitHub Actions run, download the `GameCodeSentinel-Windows-v1.5.0` artifact from the **Build Windows EXE** workflow, unzip, and run `GameCodeSentinel.exe`. Windows SmartScreen may warn for an unsigned executable. Only install software you trust.
 
 ## From source
 
@@ -29,6 +29,24 @@ Do not commit `config.json`, `codes.db`, `.env`, notification topics, logs or cr
 ## Notes
 
 The license has not been selected. Public visibility is not a license granting reuse. Credits and previous technical audit are in `AUDIT_V1.1.txt` and `AUDIT_V1.2.txt`.
+
+## Novità 1.5.0 — interfaccia desktop e riscatto assistito
+
+- **Dashboard dark professionale**, progettata senza dipendenze GUI aggiuntive: sidebar, pulsante di controllo, tre indicatori (codici visibili, attivi, punteggio ≥85), tabella leggibile, filtri e scrollbar orizzontale.
+- **Ricerca ottimizzata**: la digitazione è ritardata di 240 ms (debounce) prima di aggiornare SQLite; si evitano riletture inutili per ogni tasto.
+- **Genshin Impact**: seleziona una sola riga attiva e premi **Apri riscatto**. Il programma copia il codice e apre nel browser predefinito la pagina ufficiale `https://genshin.hoyoverse.com/en/gift?code=CODICE`. Il sito può precompilare il campo, ma il comportamento dipende da HoYoverse.
+- **Login, CAPTCHA, server, personaggio e conferma finale** restano **manuali** sul sito ufficiale. Il programma non chiede né salva credenziali, non automatizza la conferma e non marca automaticamente un codice come utilizzato. Premi **Segna usati** solo dopo aver verificato il successo.
+- **Correzione stabilità**: gestione degli errori dei thread della scansione nella GUI.
+
+**Motivo del riscatto assistito:** [HoYoverse Help Center](https://support.hoyoverse.com/hc/en-us/articles/51005644306585-Why-am-I-getting-an-error-message-that-my-redemption-code-is-invalid-or-has-already-been-used) precisa che il riscatto effettuato mediante software di terze parti può violare i termini e comportare penalizzazioni sull'account. Per proteggere l'account, la soluzione si limita ad aprire il sito ufficiale con il codice e non esegue login, invio di richieste private, CAPTCHA o click automatici. Il flusso ufficiale è documentato in [How do I redeem a gift code?](https://support.hoyoverse.com/hc/en-us/articles/50333794943513-How-do-I-redeem-a-gift-code).
+
+### Verifica della versione
+```bash
+python app.py --version
+python -m pytest -q
+```
+
+La dashboard richiede un desktop con Tkinter. I comandi `--headless` rimangono compatibili con ambienti senza interfaccia grafica. Nessun test automatico esegue un riscatto reale o interagisce con l'account di gioco.
 
 ## Novita' 1.4.0 - affidabilita' e diagnostica
 

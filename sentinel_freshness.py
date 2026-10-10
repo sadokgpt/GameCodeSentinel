@@ -129,13 +129,13 @@ def is_old_post(game: str, publication: str, *, now: datetime | None = None) -> 
 import re
 
 _CURRENT_CODES = re.compile(
-    r"(?i)\\b(?:active|working|valid|current|available|new)\\b"
-    r".{0,65}\\b(?:codes?|coupons?)\\b"
-    r"|\\b(?:codes?|coupons?)\\b.{0,35}\\b(?:active|working|valid)\\b"
+    r"(?i)\b(?:active|working|valid|current|available|new)\b"
+    r".{0,65}\b(?:codes?|coupons?)\b"
+    r"|\b(?:codes?|coupons?)\b.{0,35}\b(?:active|working|valid)\b"
 )
 _INACTIVE_CODES = re.compile(
-    r"(?i)\\b(?:expired|inactive|invalid|old|outdated|previous|"
-    r"no longer|not working|non validi|scadut[oaie])\\b"
+    r"(?i)\b(?:expired|inactive|invalid|old|outdated|previous|"
+    r"no longer|not working|non validi|scadut[oaie])\b"
 )
 
 

@@ -14,7 +14,8 @@ import time
 import webbrowser
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
+from sentinel_freshness import extract_page_dates, parse_publication_time, is_old_post
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Iterable, Optional
@@ -32,7 +33,7 @@ except Exception:
     search_dates = None
 
 APP_NAME = "GameCodeSentinel"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (+local Windows code tracker; contact: local-user)"
 REQUEST_TIMEOUT = 18
 MAX_CRAWL_LINKS = 14
@@ -120,6 +121,8 @@ class Candidate:
     context: str = ""
     reddit_confirmations: int = 0
     reddit_negatives: int = 0
+    published_at: str = ""
+    updated_at: str = ""
 
     @property
     def normalized(self) -> str:
@@ -785,9 +788,18 @@ def discover_crawl_links(base_url: str, raw_html: str, link_hint: str = "") -> l
     return links
 
 
+def enrich_with_page_dates(candidates: list[Candidate], html: str) -> list[Candidate]:
+    """Attribute the actual fetched page date, never the scanner's download time."""
+    published, updated = extract_page_dates(html)
+    for cand in candidates:
+        cand.published_at = published
+        cand.updated_at = updated
+    return candidates
+
+
 def fetch_page_source(session: requests.Session, source: Source) -> tuple[list[Candidate], int]:
     resp = http_get(session, source.url)
-    found = extract_candidates_html(source.game, resp.text, source, resp.url)
+    found = enrich_with_page_dates(extract_candidates_html(source.game, resp.text, source, resp.url), resp.text)
     # A soft-404 / cookie wall returning HTTP 200 is NOT reliable evidence
     # that codes previously listed by a tracker have gone away.
     if source.kind == "secondary" and not found and not plausible_tracker_page(resp.text, source.game):
@@ -800,12 +812,12 @@ def fetch_crawl_source(session: requests.Session, source: Source) -> tuple[list[
     first_html = resp.text
     links = discover_crawl_links(resp.url, first_html, source.link_hint)
 
-    all_candidates = extract_candidates_html(source.game, first_html, source, resp.url)
+    all_candidates = enrich_with_page_dates(extract_candidates_html(source.game, first_html, source, resp.url), first_html)
     fetched = 1
     for href in links:
         try:
             r = http_get(session, href)
-            all_candidates.extend(extract_candidates_html(source.game, r.text, source, r.url))
+            all_candidates.extend(enrich_with_page_dates(extract_candidates_html(source.game, r.text, source, r.url), r.text))
             fetched += 1
             time.sleep(0.12)
         except Exception as exc:
@@ -884,6 +896,9 @@ def fetch_reddit_source(session: requests.Session, source: Source, cfg: dict) ->
             post_url = "https://www.reddit.com" + permalink if permalink else data.get("url", url)
             post_html = f"<h1>{html_lib.escape(title)}</h1><p>{html_lib.escape(body)}</p>"
             found = extract_candidates_html(source.game, post_html, source, post_url)
+            posted = parse_publication_time(data.get("created_utc"))
+            for cand in found:
+                cand.published_at = posted
 
             # Search a small number of relevant recent comment threads too. This catches
             # codes posted only in megathread comments while keeping the daily request load low.
@@ -930,7 +945,13 @@ def fetch_reddit_source(session: requests.Session, source: Source, cfg: dict) ->
             body = "" if content_node is None else "".join(content_node.itertext()).strip()
             post_url = rss_url if link_node is None else link_node.attrib.get("href", rss_url)
             post_html = f"<h1>{title}</h1><div>{body}</div>"
-            candidates.extend(extract_candidates_html(source.game, post_html, source, post_url))
+            from_atom = extract_candidates_html(source.game, post_html, source, post_url)
+            atom_pub = entry.find("{*}published")
+            atom_mod = entry.find("{*}updated")
+            for cand in from_atom:
+                cand.published_at = parse_publication_time(atom_pub.text if atom_pub is not None else "")
+                cand.updated_at = parse_publication_time(atom_mod.text if atom_mod is not None else "")
+            candidates.extend(from_atom)
         return candidates, 1
 
     return candidates, 1
@@ -966,7 +987,10 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
 
         src_key = (c.source_name, c.source_url)
         if not any((src["name"], src["url"]) == src_key for src in item["sources"]):
-            item["sources"].append({"name": c.source_name, "url": c.source_url, "kind": c.source_kind})
+            item["sources"].append({
+                "name": c.source_name, "url": c.source_url, "kind": c.source_kind,
+                "published_at": c.published_at, "updated_at": c.updated_at,
+            })
 
         rank = rank_map.get(c.source_kind, 0)
         # Important for case-sensitive games such as Aniimo: preserve spelling from
@@ -982,8 +1006,13 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
         # Multiple posts/pages from the same source do not get multiple votes.
         # If the same source contains both an active and historical expired occurrence,
         # prefer the current active occurrence.
-        if state is None or (state[1] != "active" and c.status == "active"):
-            item["source_states"][c.source_name] = (c.source_kind, c.status)
+        # A dated old mention must not be interpreted as a fresh confirmation.
+        # It remains visible in the history; its status becomes "review", not expired.
+        evidence_status = ("review" if c.status == "active" and
+                           is_old_post(c.game, c.published_at) else c.status)
+        priority = {"active": 3, "expired": 2, "review": 1}
+        if state is None or priority[evidence_status] > priority[state[1]]:
+            item["source_states"][c.source_name] = (c.source_kind, evidence_status)
 
         if c.expires_at:
             # Prefer an official expiry over tracker/community dates. When
@@ -1001,8 +1030,14 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
         item["negatives"] = max(item["negatives"], c.reddit_negatives)
 
     for item in merged.values():
+        # Only current undated/fresh evidence contributes to the confidence score.
+        # An old post is NOT a vote even when it comes from an official channel.
+        trusted_sources = {
+            name: kind for name, (kind, status) in item["source_states"].items()
+            if status == "active"
+        }
         unique_sources = {name: kind_status[0] for name, kind_status in item["source_states"].items()}
-        kinds = list(unique_sources.values())
+        kinds = list(trusted_sources.values())
         official = "official" in kinds
         source_count = len(unique_sources)
         positives = item["confirmations"]
@@ -1016,10 +1051,12 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
                 return "publisher:gamurs"
             return "source:" + name.casefold()
 
-        secondary_count = len({editorial_group(name) for name, kind in unique_sources.items() if kind == "secondary"})
+        secondary_count = len({editorial_group(name) for name, kind in trusted_sources.items() if kind == "secondary"})
         community_count = sum(1 for kind in kinds if kind == "community")
 
-        if official:
+        if not trusted_sources:
+            score, conf = 0, "DATA POST OBSOLETA / DA RIVERIFICARE"
+        elif official:
             score, conf = 100, "UFFICIALE"
         elif secondary_count >= 2:
             score, conf = 90, "CONFERMATO (2+ fonti note)"
@@ -1043,9 +1080,14 @@ def merge_candidates(candidates: Iterable[Candidate]) -> dict[tuple[str, str], d
         for kind, status in item["source_states"].values():
             if status == "expired":
                 expired_weight += weight_map.get(kind, 0.5)
-            else:
+            elif status == "active":
                 active_weight += weight_map.get(kind, 0.5)
-        item["status"] = "expired" if expired_weight >= active_weight and expired_weight > 0 else "active"
+        if expired_weight >= active_weight and expired_weight > 0:
+            item["status"] = "expired"
+        elif active_weight > 0:
+            item["status"] = "active"
+        else:
+            item["status"] = "review"
 
         if item["expires_at"]:
             try:
